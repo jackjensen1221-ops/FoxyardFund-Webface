@@ -1,377 +1,165 @@
-import os
-
+"""Backtest engine: pure pandas, no Streamlit, so it is easy to test and reuse."""
+import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
 
-import data
-import nlp
-import theme
-from catalog import BENCHMARKS, UNIVERSES
-from engine import RULES, drawdown, metrics, run_strategy, start_year_sensitivity
-
-st.set_page_config(page_title="Backtest Lab", layout="wide")
-theme.inject()
-
-MIN_START = 2005
-PICK_RULES = [k for k in RULES if k != "random"]
-DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MSFT, TSLA, AMZN",
-                bench_key="sp500", custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
-                top_n=1, initial=10_000, annual_contrib=0.0, stop_pct=15, trailing=False, after_stop="cash",
-                cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, GOOGL, NVDA")
-for k, v in DEFAULTS.items():
-    st.session_state.setdefault(k, v)
-S = st.session_state
+RULES = {
+    "prior_year_winner": "Last year's winners",
+    "prior_year_loser": "Last year's losers (contrarian)",
+    "mom_6m": "6-month momentum",
+    "mom_12_1": "12-month momentum (skip last month)",
+    "custom_basket": "Custom Stock Basket / Mutual Fund",
+    "random": "Random picks (control)",
+}
 
 
-def pct(x):
-    return f"{x:.1%}"
+def _signal(rule, prices, stocks, yr, y, rng):
+    """Score every stock using ONLY data from before the first trading day of year y."""
+    first_day = prices.index[yr == y][0]
+    if rule in ("prior_year_winner", "prior_year_loser"):
+        prev = prices.loc[yr == y - 1, stocks]
+        if prev.empty:
+            return None
+        return prev.iloc[-1] / prev.iloc[0] - 1
+    if rule in ("mom_6m", "mom_12_1"):
+        months, skip = (6, 0) if rule == "mom_6m" else (12, 1)
+        start = first_day - pd.DateOffset(months=months)
+        end = first_day - pd.DateOffset(months=skip)
+        w = prices.loc[(prices.index >= start) & (prices.index < end), stocks]
+        if w.empty or w.index[0] > start + pd.Timedelta(days=10):
+            return None  # not enough history yet
+        return w.iloc[-1] / w.iloc[0] - 1
+    if rule == "random":
+        return pd.Series(rng.random(len(stocks)), index=stocks)
+    if rule == "custom_basket":
+        return pd.Series(1.0, index=stocks)
+    raise ValueError(f"Unknown rule: {rule}")
 
 
-def get_api_key():
-    try:
-        return st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        return os.environ.get("ANTHROPIC_API_KEY")
+def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
+                 stop_pct=0.0, trailing=False, after_stop="cash",
+                 cost_bps=0.0, tax_rate=0.0, initial=10_000, 
+                 annual_contribution=0.0, custom_weights=None, seed=0):
+    """
+    Every year, on the first trading day, buy `top_n` stocks picked by `rule`
+    (equal weight), or use `custom_weights` if provided. Optionally exit a position 
+    if it closes `stop_pct`% below its entry.
+    """
+    stocks = [c for c in prices.columns if c != bench]
+    yr = prices.index.year
+    rng = np.random.default_rng(seed)
+    cost = cost_bps / 10_000
+    capital, carry = float(initial), 0.0
+    segs, rows = [], []
+    last_year = yr[-1]
 
-
-def apply_nl():
-    """Button callback: runs BEFORE the rerun, so it may set widget state."""
-    text = S.get("nl_text", "").strip()
-    if not text:
-        return
-    if S.get("nl_calls", 0) >= 10:
-        S["nl_msg"] = ("error", "Scenario limit reached for this session. Use the sidebar controls.", "")
-        return
-    S["nl_calls"] = S.get("nl_calls", 0) + 1
-    try:
-        out = nlp.parse_question(text, get_api_key())
-    except Exception as e:
-        S["nl_msg"] = ("error", f"Couldn't read that question: {e}", "")
-        return
-    for k, v in out["widgets"].items():
-        S[k] = v
-    S["nl_msg"] = ("ok", out["explanation"], out["unsupported"])
-
-
-@st.cache_data(show_spinner="Sweeping stop-loss levels…", max_entries=16)
-def c_sweep(_prices, key, bench, start_year, params):
-    rows = []
-    for s in [0, 5, 10, 15, 20, 25, 30, 40]:
-        r = run_strategy(_prices, bench, start_year, **{**params, "stop_pct": s})
-        if r:
-            m = metrics(r["equity"])
-            rows.append({"Stop-loss": f"{s}%" if s else "None", "Final value": m["Final value"],
-                         "CAGR": m["CAGR"], "Max drawdown": m["Max drawdown"], "Sharpe": m["Sharpe (rf=0)"]})
-    return pd.DataFrame(rows)
-
-
-@st.cache_data(show_spinner="Comparing rules…", max_entries=16)
-def c_compare(_prices, key, bench, start_year, params):
-    out = []
-    for rule in PICK_RULES:
-        if rule == "custom_basket":
+    for y in range(start_year, last_year + 1):
+        cur = prices[yr == y]
+        if cur.empty:
             continue
-        r = run_strategy(_prices, bench, start_year, **{**params, "rule": rule})
-        if r:
-            out.append((rule, r["equity"], metrics(r["equity"])))
-    return out
-
-
-@st.cache_data(show_spinner="Re-running from every start year…", max_entries=16)
-def c_sens(_prices, key, bench, first, params):
-    return start_year_sensitivity(_prices, bench, first, **params)
-
-
-# ---------------- sidebar ----------------
-sb = st.sidebar
-sb.subheader("Universe")
-sb.selectbox("Stocks to pick from", list(UNIVERSES), format_func=UNIVERSES.get, key="universe")
-if S["universe"] == "custom":
-    sb.text_area("Tickers (comma-separated)", key="custom_tickers")
-elif S["universe"] == "nyse":
-    sb.select_slider("Most-traded NYSE stocks", [100, 250, 500, 1000], key="nyse_n")
-    sb.caption("Ranked by recent dollar volume. 500+ stocks can take a minute or two on first load.")
-
-sb.subheader("Benchmark")
-sb.selectbox("Compare against", list(BENCHMARKS), format_func=lambda k: BENCHMARKS[k]["label"], key="bench_key")
-if S["bench_key"] == "custom":
-    sb.text_input("Ticker", key="custom_bench")
-sb.caption(BENCHMARKS[S["bench_key"]]["note"])
-
-sb.subheader("Pick rule / Custom Fund")
-sb.selectbox("How to choose stocks each January", PICK_RULES, format_func=RULES.get, key="rule")
-
-# Custom Basket Weight Sliders
-custom_weights = None
-if S["rule"] == "custom_basket":
-    sb.markdown("---")
-    sb.markdown("### Custom Mutual Fund Weights")
-    basket_input = sb.text_input("Basket Tickers (comma-separated)", key="basket_tickers")
-    b_list = [t.strip().upper() for t in basket_input.split(",") if t.strip()]
-    custom_weights = {}
-    for t in b_list:
-        custom_weights[t] = sb.slider(f"Weight: {t}", 0.0, 1.0, 1.0 / len(b_list) if b_list else 1.0, 0.05)
-    sb.markdown("---")
-
-if S["rule"] != "custom_basket":
-    sb.slider("Number of stocks to buy", 1, 10, key="top_n")
-
-sb.slider("First buy year", MIN_START, 2025, key="start_year")
-sb.number_input("Starting amount ($)", 100, 10_000_000, step=500, key="initial")
-sb.number_input("Yearly Contribution / DCA ($)", 0, 100_000, step=500, key="annual_contrib")
-
-sb.subheader("Risk rule")
-sb.slider("Sell if down X% (0 = no stop-loss)", 0, 50, key="stop_pct")
-sb.checkbox("Trailing (measured from the peak, not entry)", key="trailing")
-sb.radio("After a sell, hold…", ["cash", "benchmark"], key="after_stop",
-         format_func=lambda x: "Cash" if x == "cash" else "The benchmark until next January")
-
-sb.subheader("Costs and taxes")
-sb.slider("Trading cost per trade (basis points)", 0, 50, key="cost_bps",
-          help="5 bps = 0.05% on every buy and every sell.")
-sb.slider("Tax on realized gains (%)", 0, 50, key="tax_pct",
-          help="Applied each year-end when the portfolio rotates. Losses carry forward.")
-
-# ---------------- header + scenario bar ----------------
-theme.header("Test an investing rule or custom mutual fund against history before risking real money.")
-
-has_key = bool(get_api_key())
-col_in, col_btn = st.columns([6, 1], vertical_alignment="bottom")
-col_in.text_input("Describe a scenario", key="nl_text", disabled=not has_key, label_visibility="collapsed",
-                  placeholder="Describe a scenario: buy the 3 best NYSE stocks of last year, sell anything down 10%")
-col_btn.button("Apply", on_click=apply_nl, type="primary", disabled=not has_key)
-if not has_key:
-    st.caption("Plain-English setup is off. Add ANTHROPIC_API_KEY to your app's secrets to enable it; the sidebar works without it.")
-msg = S.get("nl_msg")
-if msg:
-    kind, text, extra = msg
-    st.caption(f"Simulating: {text}") if kind == "ok" else st.error(text)
-    if extra:
-        st.caption(f"Not modeled: {extra}")
-
-# ---------------- data ----------------
-if S["universe"] == "nyse":
-    with st.spinner("Ranking NYSE stocks by trading volume (first run takes a minute)…"):
-        universe_list = data.get_universe("nyse", "", S["nyse_n"])
-else:
-    universe_list = data.get_universe(S["universe"], S["custom_tickers"], S["nyse_n"])
-
-# Ensure custom basket tickers are included in download list if custom basket is selected
-if S["rule"] == "custom_basket" and custom_weights:
-    universe_list = list(set(universe_list + list(custom_weights.keys())))
-
-if not universe_list:
-    st.error("Couldn't build the stock universe. Check your tickers or try again in a minute.")
-    st.stop()
-
-stock_prices = data.load_many(universe_list, "Downloading price history")
-if stock_prices.empty:
-    st.error("No price data came back. Yahoo may be rate-limiting; wait a minute and refresh.")
-    st.stop()
-
-bench, bench_series = data.build_benchmark(S["bench_key"], S["custom_bench"], stock_prices)
-if bench_series is None or bench_series.dropna().empty:
-    st.error(f"No data for benchmark {bench}. The fund may have closed, or the ticker is wrong.")
-    st.stop()
-
-prices = stock_prices.drop(columns=[bench], errors="ignore")
-prices[bench] = bench_series.reindex(prices.index).ffill()
-
-fv = prices[bench].first_valid_index()
-min_ok = max(MIN_START, fv.year + (0 if fv.dayofyear <= 10 else 1))
-start_year = max(S["start_year"], min_ok)
-if start_year > 2025 or start_year > prices.index[-1].year - 1:
-    st.error(f"{bench} doesn't have enough history. Pick another benchmark.")
-    st.stop()
-if start_year != S["start_year"]:
-    st.caption(f"{bench} data begins {fv:%b %Y}, so the first buy year was moved to {start_year}.")
-
-data_key = (tuple(prices.columns), str(prices.index[-1].date()))
-params = dict(rule=S["rule"], top_n=S["top_n"], stop_pct=S["stop_pct"], trailing=S["trailing"],
-              after_stop=S["after_stop"], cost_bps=S["cost_bps"], tax_rate=S["tax_pct"] / 100,
-              initial=S["initial"], annual_contribution=S["annual_contrib"], custom_weights=custom_weights)
-initial = S["initial"]
-
-res = run_strategy(prices, bench, start_year, **params)
-if res is None:
-    st.error("Not enough data for this setup. Try a later start year or different tickers.")
-    st.stop()
-eq, be, yrs = res["equity"], res["bench"], res["years"]
-ms, mb = metrics(eq), metrics(be)
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["Overview", "Year by year", "Compare rules", "Start-year test", "Stop-loss sweep", "Reality check"])
-
-# ---- Overview
-with tab1:
-    theme.hero("Portfolio value", f"${ms['Final value']:,.0f}", ms["Final value"] / initial - 1,
-               f"since {eq.index[0]:%b %Y}  ·  {bench} {pct(be.iloc[-1] / initial - 1)}")
-    n_stocks = prices.shape[1] - 1
-    chips_list = [RULES[S["rule"]], f"Top {S['top_n']}" if S["rule"] != "custom_basket" else "Custom Basket",
-                  (f"Stop-loss {S['stop_pct']}%" + (" trailing" if S["trailing"] else "")) if S["stop_pct"] else "No stop-loss",
-                  f"{S['cost_bps']} bps costs"]
-    if S["tax_pct"]:
-        chips_list.append(f"{S['tax_pct']}% tax")
-    if S["annual_contrib"]:
-        chips_list.append(f"${S['annual_contrib']:,.0f}/yr DCA")
-    chips_list += [f"{UNIVERSES[S['universe']]}: {n_stocks} stocks", f"vs {bench}"]
-    theme.chips(chips_list)
-
-    left, right = st.columns([4, 3], vertical_alignment="bottom")
-    with left:
-        theme.section("Performance")
-    with right:
-        opts = ["1Y", "3Y", "5Y", "10Y", "MAX"]
-        if hasattr(st, "segmented_control"):
-            period = st.segmented_control("Range", opts, default="MAX", key="period",
-                                          label_visibility="collapsed") or "MAX"
+            
+        # Handle Custom Mutual Fund / Portfolio vs Rule-based selection
+        if rule == "custom_basket" and custom_weights:
+            picks = [t for t in custom_weights.keys() if t in cur.columns]
+            if not picks:
+                continue
+            weights = pd.Series({t: custom_weights[t] for t in picks})
+            if weights.sum() > 0:
+                weights = weights / weights.sum() # Normalize to 100%
+            else:
+                weights = pd.Series(1.0 / len(picks), index=picks)
         else:
-            period = st.radio("Range", opts, index=4, horizontal=True, key="period", label_visibility="collapsed")
+            sig = _signal(rule, prices, stocks, yr, y, rng)
+            if sig is None or sig.empty:
+                continue
+            sig = sig.sort_values(ascending=(rule == "prior_year_loser"))
+            picks = list(sig.index[:top_n])
+            weights = pd.Series(1.0 / len(picks), index=picks)
 
-    def window(s):
-        if period == "MAX":
-            return s
-        return s[s.index >= s.index[-1] - pd.DateOffset(years=int(period[:-1]))]
+        bench_path = cur[bench] / cur[bench].iloc[0]
+        vals, stopped = [], []
+        
+        for t in picks:
+            raw = (cur[t] / cur[t].iloc[0]).ffill()
+            path = raw * (1 - cost)  # buy cost
+            if stop_pct > 0:
+                ref = raw.cummax() if trailing else 1.0
+                hit = raw <= ref * (1 - stop_pct / 100)
+                if hit.any():
+                    d = hit.idxmax()
+                    val = path[d] * (1 - cost)  # sell cost
+                    path = path.copy()
+                    if after_stop == "benchmark":
+                        path.loc[d:] = val * (1 - cost) * (bench_path.loc[d:] / bench_path[d])
+                    else:
+                        path.loc[d:] = val
+                    stopped.append(f"{t} ({d:%b %d})")
+            vals.append(path * weights[t])
 
-    e_p, b_p = window(eq), window(be)
-    e_p, b_p = e_p / e_p.iloc[0] * initial, b_p / b_p.iloc[0] * initial
-    log = st.toggle("Log scale", value=False)
-    
-    fig = go.Figure()
-    fig.add_scatter(x=e_p.index, y=e_p, name="Strategy / Custom Fund", line=dict(width=2.5, color=theme.ACCENT))
-    fig.add_scatter(x=b_p.index, y=b_p, name=bench, line=dict(width=1.75, color=theme.BENCH))
-    
-    # Major Historical Market Crash & Event Lines
-    market_events = {
-        "2008-09-15": "2008 Financial Crisis",
-        "2020-03-16": "COVID-19 Crash",
-        "2022-01-03": "2022 Rate Hike Peak"
+        if not vals:
+            continue
+
+        port = pd.concat(vals, axis=1).sum(axis=1) * capital
+        tax_paid = 0.0
+        
+        if y < last_year:  # year-end rotation realizes gains
+            end_val = port.iloc[-1] * (1 - cost)
+            taxable = (end_val - capital) + carry
+            if taxable > 0:
+                tax_paid, carry = tax_rate * taxable, 0.0
+            else:
+                carry = taxable
+            # Apply annual contribution at year boundary
+            port.iloc[-1] = (end_val - tax_paid) + annual_contribution
+
+        segs.append(port)
+        rows.append({
+            "Year": y,
+            "Bought": ", ".join(picks),
+            "Signal": float(sig.iloc[:len(picks)].mean()) if rule != "custom_basket" else 0.0,
+            "Stopped out": ", ".join(stopped) if stopped else "-",
+            "Tax paid": tax_paid,
+            "Strategy": port.iloc[-1] / (capital + (annual_contribution if y > start_year else 0)) - 1,
+            "Benchmark": bench_path.iloc[-1] - 1,
+        })
+        capital = port.iloc[-1]
+
+    if not segs:
+        return None
+    equity = pd.concat(segs)
+    b = prices[bench].reindex(equity.index).ffill()
+    return {"equity": equity, "bench": b / b.iloc[0] * initial, "years": pd.DataFrame(rows)}
+
+
+def metrics(equity):
+    r = equity.pct_change().dropna()
+    yrs = max((equity.index[-1] - equity.index[0]).days / 365.25, 1e-9)
+    vol = r.std() * np.sqrt(252)
+    return {
+        "Final value": equity.iloc[-1],
+        "CAGR": (equity.iloc[-1] / equity.iloc[0]) ** (1 / yrs) - 1,
+        "Volatility": vol,
+        "Sharpe (rf=0)": (r.mean() * 252) / vol if vol > 0 else np.nan,
+        "Max drawdown": drawdown(equity).min(),
     }
-    for ev_date, label in market_events.items():
-        dt = pd.to_datetime(ev_date)
-        if e_p.index.min() <= dt <= e_p.index.max():
-            fig.add_vline(x=dt, line_dash="dash", line_color="gray", annotation_text=label)
 
-    fig.update_layout(height=400, hovermode="x unified", yaxis_type="log" if log else "linear",
-                      yaxis_tickprefix="$")
-    theme.chart(fig)
-    st.caption(f"{period}: strategy {e_p.iloc[-1] / initial - 1:+.1%}  ·  {bench} {b_p.iloc[-1] / initial - 1:+.1%}")
 
-    last = yrs.iloc[-1]
-    cur = prices[prices.index.year == last["Year"]]
-    tiles = []
-    for t in last["Bought"].split(", "):
-        if t in cur.columns:
-            r = cur[t].ffill().iloc[-1] / cur[t].iloc[0] - 1
-            tiles.append((t, r, f"{t} (" in last["Stopped out"]))
-    theme.section(f"Holdings in {last['Year']}", "bought on the first trading day")
-    theme.picks(tiles)
+def drawdown(equity):
+    return equity / equity.cummax() - 1
 
-    theme.section("Key numbers", f"strategy vs {bench}")
-    k = st.columns(4)
-    k[0].metric("CAGR", pct(ms["CAGR"]), f"{bench}: {pct(mb['CAGR'])}", delta_color="off")
-    k[1].metric("Max drawdown", pct(ms["Max drawdown"]), f"{bench}: {pct(mb['Max drawdown'])}", delta_color="off")
-    k[2].metric("Worst year", pct(yrs["Strategy"].min()), f"{bench}: {pct(yrs['Benchmark'].min())}", delta_color="off")
-    k[3].metric("Years beating benchmark", f"{(yrs['Strategy'] > yrs['Benchmark']).sum()} / {len(yrs)}")
-    if params["tax_rate"] > 0:
-        st.caption(f"Total tax paid by the strategy: ${yrs['Tax paid'].sum():,.0f}. "
-                   f"{bench} is shown as untaxed buy-and-hold, which flatters it slightly.")
 
-    theme.section("Drawdown", "decline from the previous peak")
-    dfig = go.Figure()
-    dfig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy", line=dict(width=1.5, color=theme.RED),
-                     fill="tozeroy", fillcolor="rgba(255,92,108,0.10)")
-    dfig.add_scatter(x=be.index, y=drawdown(be), name=bench, line=dict(width=1.25, color=theme.BENCH))
-    dfig.update_layout(height=250, yaxis_tickformat=".0%", hovermode="x unified")
-    theme.chart(dfig)
-
-# ---- Year by year
-with tab2:
-    sty = yrs.style.format({"Year": "{:d}", "Signal": "{:.1%}", "Strategy": "{:+.1%}",
-                            "Benchmark": "{:+.1%}", "Tax paid": "${:,.0f}"})
-    st.dataframe(theme.color_cols(sty, ["Strategy", "Benchmark"]), hide_index=True)
-    bar = go.Figure()
-    bar.add_bar(x=yrs["Year"], y=yrs["Strategy"], name="Strategy", marker_color=theme.ACCENT)
-    bar.add_bar(x=yrs["Year"], y=yrs["Benchmark"], name=bench, marker_color=theme.BENCH)
-    bar.update_layout(barmode="group", height=320, yaxis_tickformat=".0%")
-    theme.chart(bar)
-
-# ---- Compare rules (+ random control)
-with tab3:
-    st.write("Your current settings applied to each selection rule.")
-    cfig, rows = go.Figure(), []
-    for rule, e, m in c_compare(prices, data_key, bench, start_year, params):
-        cfig.add_scatter(x=e.index, y=e, name=RULES[rule])
-        rows.append({"Rule": RULES[rule], "Final value": m["Final value"], "CAGR": m["CAGR"],
-                     "Max drawdown": m["Max drawdown"], "Sharpe": m["Sharpe (rf=0)"]})
-    cfig.add_scatter(x=be.index, y=be, name=bench, line=dict(width=1.75, color=theme.BENCH))
-    cfig.update_layout(height=400, hovermode="x unified", yaxis_type="log", yaxis_tickprefix="$")
-    theme.chart(cfig)
-    st.dataframe(pd.DataFrame(rows).style.format(
-        {"Final value": "${:,.0f}", "CAGR": "{:.1%}", "Max drawdown": "{:.1%}", "Sharpe": "{:.2f}"}),
-        hide_index=True)
-
-    theme.section("Is it better than luck?")
-    st.caption("Runs the same settings with randomly chosen stocks many times.")
-    n_sims = st.slider("Random simulations", 10, 100, 30)
-    if st.button("Run random-pick test"):
-        cagrs, prog = [], st.progress(0.0)
-        for s in range(n_sims):
-            r = run_strategy(prices, bench, start_year, **{**params, "rule": "random", "seed": s})
-            cagrs.append(metrics(r["equity"])["CAGR"])
-            prog.progress((s + 1) / n_sims)
-        prog.empty()
-        rnd = pd.Series(cagrs)
-        a, b, c2 = st.columns(3)
-        a.metric("Your rule's CAGR", pct(ms["CAGR"]))
-        b.metric("Random picks: median", pct(rnd.median()),
-                 f"10th–90th pct: {pct(rnd.quantile(.1))} to {pct(rnd.quantile(.9))}", delta_color="off")
-        c2.metric("Random runs your rule beat", pct((ms["CAGR"] > rnd).mean()))
-
-# ---- Start-year sensitivity
-with tab4:
-    st.write("Same strategy, started in every possible year and held to today.")
-    sens = c_sens(prices, data_key, bench, min_ok, params)
-    if sens.empty:
-        st.info("Not enough history for this test.")
-    else:
-        a, b, c3, d = st.columns(4)
-        a.metric("Start years tested", len(sens))
-        b.metric("Start years beating benchmark", f"{(sens['Excess'] > 0).sum()} / {len(sens)}")
-        c3.metric("Median edge vs benchmark", f"{sens['Excess'].median() * 100:+.1f} pts CAGR")
-        d.metric("Worst start year (CAGR)", pct(sens["Strategy CAGR"].min()))
-        sfig = go.Figure()
-        sfig.add_bar(x=sens["Start year"], y=sens["Strategy CAGR"], name="Strategy", marker_color=theme.ACCENT)
-        sfig.add_bar(x=sens["Start year"], y=sens["Benchmark CAGR"], name=bench, marker_color=theme.BENCH)
-        sfig.update_layout(barmode="group", height=340, yaxis_tickformat=".0%", xaxis_title="Start year",
-                            yaxis_title="CAGR to today")
-        theme.chart(sfig)
-        sty = sens.style.format({"Start year": "{:d}", "Strategy CAGR": "{:.1%}", "Benchmark CAGR": "{:.1%}",
-                                 "Excess": "{:+.1%}", "Strategy final": "${:,.0f}",
-                                 "Benchmark final": "${:,.0f}", "Max drawdown": "{:.1%}"})
-        st.dataframe(theme.color_cols(sty, ["Excess"]), hide_index=True)
-
-# ---- Stop-loss sweep
-with tab5:
-    st.write("Same strategy, different stop-loss levels.")
-    sw = c_sweep(prices, data_key, bench, start_year, params)
-    sfig = go.Figure(go.Bar(x=sw["Stop-loss"], y=sw["CAGR"], marker_color=theme.ACCENT))
-    sfig.update_layout(height=300, yaxis_tickformat=".0%", xaxis_title="Stop-loss", yaxis_title="CAGR")
-    theme.chart(sfig)
-    st.dataframe(sw.style.format({"Final value": "${:,.0f}", "CAGR": "{:.1%}",
-                                  "Max drawdown": "{:.1%}", "Sharpe": "{:.2f}"}), hide_index=True)
-
-# ---- Reality check
-with tab6:
-    theme.section("Limitations", "read before trusting any result")
-    st.markdown("""
-- **Survivorship bias.** The S&P 500 and NYSE universes are built from *today's* stocks.
-- **NYSE universe.** Stocks come from the official NYSE listing, minus preferreds and funds.
-- **Stops use daily closes.** Real stops can fill worse after an overnight gap.
-- **Costs and taxes are simplified.**
-""")
-    theme.section("Current leaders", "year-to-date")
-    this_year = prices[prices.index.year == prices.index[-1].year].drop(columns=[bench], errors="ignore")
-    ytd = (this_year.iloc[-1] / this_year.iloc[0] - 1).dropna().sort_values(ascending=False).head(10)
-    st.dataframe(theme.color_cols(ytd.rename("YTD return").to_frame().style.format("{:+.1%}"), ["YTD return"]))
+def start_year_sensitivity(prices, bench, first=2005, **kw):
+    """Re-run the strategy from every possible start year, each ending at the latest date."""
+    rows = []
+    for sy in range(first, prices.index[-1].year - 1):
+        r = run_strategy(prices, bench, sy, **kw)
+        if r is None:
+            continue
+        ms, mb = metrics(r["equity"]), metrics(r["bench"])
+        rows.append({
+            "Start year": sy,
+            "Strategy CAGR": ms["CAGR"], "Benchmark CAGR": mb["CAGR"],
+            "Excess": ms["CAGR"] - mb["CAGR"],
+            "Strategy final": ms["Final value"], "Benchmark final": mb["Final value"],
+            "Max drawdown": ms["Max drawdown"],
+        })
+    return pd.DataFrame(rows)
