@@ -1,6 +1,8 @@
 """Turn a plain-English 'what if' question into backtest settings using Claude."""
 import re
 
+from catalog import BENCHMARKS
+
 MODEL = "claude-haiku-5-5"   # cheap and fast; swap for "claude-sonnet-5-5" if you want more nuance
 
 RULES = ["prior_year_winner", "prior_year_loser", "mom_6m", "mom_12_1"]
@@ -8,6 +10,8 @@ RULES = ["prior_year_winner", "prior_year_loser", "mom_6m", "mom_12_1"]
 SYSTEM = """You configure a stock backtesting tool. Convert the user's question into settings by calling set_backtest.
 What the tool can do: once a year (first trading day of January) buy the top N stocks chosen by a rule, equal weight.
 Rules: prior_year_winner (best last calendar year), prior_year_loser (worst last year), mom_6m, mom_12_1.
+Universes: large_cap (30 big stocks), sp500, nyse (most-traded NYSE stocks), custom (user named tickers).
+Benchmarks: sp500, nasdaq100, small_caps, dow, total_market, sixty_forty, bonds, gold, equal_weight, hedge_fund (QAI), long_short, managed_futures, market_neutral, merger_arb, berkshire. If the user names another ticker, use benchmark_ticker instead.
 Optional stop-loss as a PERCENT drop from entry (or from the peak if trailing), checked on daily closes; after a sell the money sits in cash or moves to the benchmark until next January. Optional trading costs and a tax rate on realized gains.
 Only set fields the user actually mentioned or clearly implied; omit everything else.
 If the user gives a stop-loss as a dollar amount or says 'X' without a number, do not invent one: omit stop_pct and say so in 'unsupported'.
@@ -30,9 +34,10 @@ TOOL = {
             "start_year": {"type": "integer", "description": "First year to buy (2005-2025)."},
             "cost_bps": {"type": "number", "description": "Cost per trade in basis points."},
             "tax_pct": {"type": "number", "description": "Tax rate on realized gains, percent."},
-            "universe": {"type": "string", "enum": ["large_cap", "sp500", "custom"]},
+            "universe": {"type": "string", "enum": ["large_cap", "sp500", "nyse", "custom"]},
             "tickers": {"type": "array", "items": {"type": "string"}, "description": "Only if user named specific stocks."},
-            "benchmark": {"type": "string", "description": "Benchmark ticker, e.g. SPY or QQQ."},
+            "benchmark": {"type": "string", "enum": [k for k in BENCHMARKS if k != "custom"]},
+            "benchmark_ticker": {"type": "string", "description": "Only for a benchmark not in the list."},
         },
         "required": ["explanation"],
     },
@@ -62,16 +67,19 @@ def clean(raw: dict) -> dict:
         w["cost_bps"] = int(_clamp(round(raw["cost_bps"]), 0, 100))
     if isinstance(raw.get("tax_pct"), (int, float)):
         w["tax_pct"] = int(_clamp(round(raw["tax_pct"]), 0, 60))
-    if raw.get("universe") in ("large_cap", "sp500", "custom"):
+    if raw.get("universe") in ("large_cap", "sp500", "nyse", "custom"):
         w["universe"] = raw["universe"]
     tickers = [t.strip().upper().replace(".", "-") for t in raw.get("tickers", []) if isinstance(t, str)]
     tickers = [t for t in tickers if re.fullmatch(r"[A-Z0-9\-]{1,10}", t)][:40]
     if tickers:
         w["custom_tickers"] = ", ".join(tickers)
         w["universe"] = "custom"
-    b = str(raw.get("benchmark", "")).strip().upper()
-    if re.fullmatch(r"[A-Z0-9\-]{1,10}", b):
-        w["bench"] = b
+    if raw.get("benchmark") in BENCHMARKS and raw["benchmark"] != "custom":
+        w["bench_key"] = raw["benchmark"]
+    else:
+        b = str(raw.get("benchmark_ticker", "")).strip().upper()
+        if re.fullmatch(r"[A-Z0-9\-]{1,10}", b):
+            w["bench_key"], w["custom_bench"] = "custom", b
     return {"widgets": w,
             "explanation": str(raw.get("explanation", "")).strip(),
             "unsupported": str(raw.get("unsupported", "")).strip()}
