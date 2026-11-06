@@ -1,8 +1,6 @@
 """Turn a plain-English 'what if' question into backtest settings using Claude."""
 import re
 
-import anthropic
-
 MODEL = "claude-haiku-5-5"   # cheap and fast; swap for "claude-sonnet-5-5" if you want more nuance
 
 RULES = ["prior_year_winner", "prior_year_loser", "mom_6m", "mom_12_1"]
@@ -80,6 +78,7 @@ def clean(raw: dict) -> dict:
 
 
 def parse_question(text: str, api_key: str) -> dict:
+    import anthropic  # imported here so the app still loads if the package is missing
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model=MODEL, max_tokens=700, system=SYSTEM, tools=[TOOL],
