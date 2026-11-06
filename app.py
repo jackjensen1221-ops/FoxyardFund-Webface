@@ -8,9 +8,11 @@ import streamlit as st
 import yfinance as yf
 
 import nlp
+import theme
 from engine import RULES, drawdown, metrics, run_strategy, start_year_sensitivity
 
-st.set_page_config(page_title="Backtest Lab", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Backtest Lab", layout="wide")
+theme.inject()
 
 LOAD_FROM, MIN_START = "2004-01-01", 2005
 LARGE_CAPS = ("AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO JPM V UNH XOM JNJ WMT PG "
@@ -45,6 +47,10 @@ def apply_nl():
     text = st.session_state.get("nl_text", "").strip()
     if not text:
         return
+    if st.session_state.get("nl_calls", 0) >= 10:
+        st.session_state["nl_msg"] = ("error", "Scenario limit reached for this session. Use the sidebar controls.", "")
+        return
+    st.session_state["nl_calls"] = st.session_state.get("nl_calls", 0) + 1
     try:
         out = nlp.parse_question(text, get_api_key())
     except Exception as e:
@@ -105,7 +111,7 @@ def c_sens(_prices, key, bench, params):
 
 
 # ---------------- sidebar ----------------
-st.sidebar.title("Strategy")
+st.sidebar.subheader("Universe")
 st.sidebar.selectbox("Stock universe", UNIVERSES, key="universe")
 if st.session_state["universe"] == "Custom":
     raw = st.sidebar.text_area("Tickers (comma-separated)", key="custom_tickers")
@@ -131,31 +137,31 @@ bench = st.session_state["bench"].strip().upper()
 st.sidebar.radio("After a sell, hold…", ["cash", "benchmark"], key="after_stop",
                  format_func=lambda x: "Cash" if x == "cash" else f"{bench} until next January")
 
-st.sidebar.subheader("Real-world friction")
+st.sidebar.subheader("Costs and taxes")
 st.sidebar.slider("Trading cost per trade (basis points)", 0, 50, key="cost_bps",
                   help="5 bps = 0.05% on every buy and every sell.")
 st.sidebar.slider("Tax on realized gains (%)", 0, 50, key="tax_pct",
                   help="Applied each year-end when the portfolio rotates. Losses carry forward.")
 
 # ---------------- header + natural-language box ----------------
-st.title("📈 Backtest Lab")
-st.caption("Ask 'what if…' about the past. Educational tool, not investment advice.")
+theme.header("Backtest Lab", "Test an investing rule against history before risking real money. Educational tool, not investment advice.")
 
-with st.container(border=True):
-    has_key = bool(get_api_key())
-    st.text_input("Ask a what-if question", key="nl_text", disabled=not has_key,
-                  placeholder="What if I bought the 3 best stocks of the previous year every January "
-                              "and sold anything that fell 10%?")
-    st.button("Set up simulation", on_click=apply_nl, type="primary", disabled=not has_key)
-    if not has_key:
-        st.info("Add `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml` (or as an environment variable) "
-                "to turn on plain-English setup. The sidebar works without it.")
-    msg = st.session_state.get("nl_msg")
-    if msg:
-        kind, text, extra = msg
-        (st.success if kind == "ok" else st.error)(text)
-        if extra:
-            st.warning(f"Not modeled: {extra}")
+has_key = bool(get_api_key())
+col_in, col_btn = st.columns([6, 1], vertical_alignment="bottom")
+col_in.text_input("Describe a scenario", key="nl_text", disabled=not has_key, label_visibility="collapsed",
+                  placeholder="Describe a scenario: buy last year's 3 best stocks every January, sell anything down 10%")
+col_btn.button("Apply", on_click=apply_nl, type="primary", disabled=not has_key)
+if not has_key:
+    st.caption("Plain-English setup is off. Add ANTHROPIC_API_KEY to your app's secrets to enable it; the sidebar works without it.")
+msg = st.session_state.get("nl_msg")
+if msg:
+    kind, text, extra = msg
+    if kind == "ok":
+        st.caption(f"Simulating: {text}")
+    else:
+        st.error(text)
+    if extra:
+        st.caption(f"Not modeled: {extra}")
 
 # ---------------- data + run ----------------
 with st.spinner(f"Loading prices for {len(universe_list)} tickers…"):
@@ -194,20 +200,26 @@ with tab1:
         st.caption(f"Total tax paid by the strategy: ${yrs['Tax paid'].sum():,.0f}. "
                    f"{bench} is shown as untaxed buy-and-hold, which flatters it slightly.")
 
+    theme.lede(
+        f"${initial:,.0f} invested on the first trading day of {yrs['Year'].iloc[0]} would have grown to "
+        f"<b>${ms['Final value']:,.0f}</b> ({pct(ms['CAGR'])} a year) under this rule, against "
+        f"${mb['Final value']:,.0f} ({pct(mb['CAGR'])} a year) for {bench}. The deepest drop along the way was "
+        f"{pct(ms['Max drawdown'])}, versus {pct(mb['Max drawdown'])} for {bench}.")
+    theme.section("Growth of your money")
     log = st.toggle("Log scale", value=False)
     fig = go.Figure()
-    fig.add_scatter(x=eq.index, y=eq, name="Strategy", line=dict(width=2.5))
-    fig.add_scatter(x=be.index, y=be, name=bench, line=dict(width=2, dash="dot"))
+    fig.add_scatter(x=eq.index, y=eq, name="Strategy", line=dict(width=2.5, color=theme.ACCENT))
+    fig.add_scatter(x=be.index, y=be, name=bench, line=dict(width=1.75, color=theme.MUTED))
     fig.update_layout(height=430, hovermode="x unified", yaxis_title="Portfolio value ($)",
                       yaxis_type="log" if log else "linear", margin=dict(t=20))
-    st.plotly_chart(fig)
+    theme.chart(fig)
 
+    theme.section("Drawdown", "decline from the previous peak")
     dfig = go.Figure()
-    dfig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy", fill="tozeroy")
-    dfig.add_scatter(x=be.index, y=drawdown(be), name=bench)
-    dfig.update_layout(height=280, title="Drawdown (peak-to-trough loss)",
-                       yaxis_tickformat=".0%", hovermode="x unified", margin=dict(t=40))
-    st.plotly_chart(dfig)
+    dfig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy", fill="tozeroy", line=dict(width=1.25, color=theme.ACCENT), fillcolor=theme.ACCENT_FILL)
+    dfig.add_scatter(x=be.index, y=drawdown(be), name=bench, line=dict(width=1.25, color=theme.MUTED))
+    dfig.update_layout(height=260, yaxis_tickformat=".0%", hovermode="x unified")
+    theme.chart(dfig)
 
     fmt = {"Final value": "${:,.0f}", "CAGR": "{:.1%}", "Volatility": "{:.1%}",
            "Sharpe (rf=0)": "{:.2f}", "Max drawdown": "{:.1%}"}
@@ -222,10 +234,10 @@ with tab2:
     show["Tax paid"] = show["Tax paid"].map(lambda v: f"${v:,.0f}")
     st.dataframe(show, hide_index=True)
     bar = go.Figure()
-    bar.add_bar(x=yrs["Year"], y=yrs["Strategy"], name="Strategy")
-    bar.add_bar(x=yrs["Year"], y=yrs["Benchmark"], name=bench)
+    bar.add_bar(x=yrs["Year"], y=yrs["Strategy"], name="Strategy", marker_color=theme.ACCENT)
+    bar.add_bar(x=yrs["Year"], y=yrs["Benchmark"], name=bench, marker_color=theme.MUTED)
     bar.update_layout(barmode="group", height=320, yaxis_tickformat=".0%", margin=dict(t=20))
-    st.plotly_chart(bar)
+    theme.chart(bar)
 
 # ---- Compare rules (+ random control)
 with tab3:
@@ -236,15 +248,15 @@ with tab3:
         cfig.add_scatter(x=e.index, y=e, name=RULES[rule])
         rows.append({"Rule": RULES[rule], "Final value": m["Final value"], "CAGR": m["CAGR"],
                      "Max drawdown": m["Max drawdown"], "Sharpe": m["Sharpe (rf=0)"]})
-    cfig.add_scatter(x=be.index, y=be, name=bench, line=dict(dash="dot", color="gray"))
+    cfig.add_scatter(x=be.index, y=be, name=bench, line=dict(width=1.75, color=theme.MUTED))
     cfig.update_layout(height=400, hovermode="x unified", yaxis_type="log",
                        yaxis_title="Portfolio value ($, log)", margin=dict(t=20))
-    st.plotly_chart(cfig)
+    theme.chart(cfig)
     st.dataframe(pd.DataFrame(rows).style.format(
         {"Final value": "${:,.0f}", "CAGR": "{:.1%}", "Max drawdown": "{:.1%}", "Sharpe": "{:.2f}"}),
         hide_index=True)
 
-    st.subheader("Is it better than luck?")
+    theme.section("Is it better than luck?")
     st.caption("Runs the same settings with randomly chosen stocks many times. "
                "If your rule can't clearly beat random picks, it isn't telling you much.")
     n_sims = st.slider("Random simulations", 10, 100, 30)
@@ -276,11 +288,11 @@ with tab4:
         c3.metric("Median edge vs benchmark (CAGR)", f"{sens['Excess'].median() * 100:+.1f} pts")
         d.metric("Worst start year (CAGR)", pct(sens["Strategy CAGR"].min()))
         sfig = go.Figure()
-        sfig.add_bar(x=sens["Start year"], y=sens["Strategy CAGR"], name="Strategy")
-        sfig.add_bar(x=sens["Start year"], y=sens["Benchmark CAGR"], name=bench)
+        sfig.add_bar(x=sens["Start year"], y=sens["Strategy CAGR"], name="Strategy", marker_color=theme.ACCENT)
+        sfig.add_bar(x=sens["Start year"], y=sens["Benchmark CAGR"], name=bench, marker_color=theme.MUTED)
         sfig.update_layout(barmode="group", height=340, yaxis_tickformat=".0%",
                            xaxis_title="Start year", yaxis_title="CAGR to today", margin=dict(t=20))
-        st.plotly_chart(sfig)
+        theme.chart(sfig)
         st.dataframe(sens.style.format({
             "Strategy CAGR": "{:.1%}", "Benchmark CAGR": "{:.1%}", "Excess": "{:+.1%}",
             "Strategy final": "${:,.0f}", "Benchmark final": "${:,.0f}", "Max drawdown": "{:.1%}"}),
@@ -291,26 +303,23 @@ with tab5:
     st.write("Same strategy, different stop-loss levels. Look for a stable plateau, not one lucky spike. "
              "A spike usually means overfitting.")
     sw = c_sweep(prices, data_key, bench, start_year, params)
-    sfig = go.Figure(go.Bar(x=sw["Stop-loss %"], y=sw["CAGR"]))
+    sfig = go.Figure(go.Bar(x=sw["Stop-loss %"], y=sw["CAGR"], marker_color=theme.ACCENT))
     sfig.update_layout(height=300, yaxis_tickformat=".0%", xaxis_title="Stop-loss %",
                        yaxis_title="CAGR", margin=dict(t=20))
-    st.plotly_chart(sfig)
+    theme.chart(sfig)
     st.dataframe(sw.style.format({"Final value": "${:,.0f}", "CAGR": "{:.1%}",
                                   "Max drawdown": "{:.1%}", "Sharpe": "{:.2f}"}), hide_index=True)
 
 # ---- Reality check
 with tab6:
-    st.subheader("How much should you trust this?")
-    st.warning(
-        "**Survivorship bias:** the S&P 500 list is *today's* members. Companies that collapsed "
-        "or were dropped aren't in it, which flatters any 'pick the winner' strategy.\n\n"
-        "**Stops use daily closes.** Real stops can fill worse after overnight gaps.\n\n"
-        "**Costs and taxes are simplified.** Flat per-trade cost, one tax rate on net yearly gains, "
-        "and the portfolio is treated as fully sold and rebought every January even if the same "
-        "stock is picked again.\n\n"
-        "**Small sample:** a few picks a year over ~15 years is not much data. "
-        "Use the Start-year test and the random-pick test before believing any result.")
-    st.subheader("Current leaders (year-to-date)")
+    theme.section("Limitations", "read before trusting any result")
+    st.markdown("""
+- **Survivorship bias.** The S&P 500 list is *today's* members. Companies that collapsed or were dropped are missing, which flatters any pick-the-winner rule.
+- **Stops use daily closes.** Real stops can fill worse after an overnight gap.
+- **Costs and taxes are simplified.** A flat per-trade cost, one tax rate on net yearly gains, and the portfolio is treated as fully sold and rebought every January.
+- **Small sample.** A few picks a year over about 15 years is not much data. Run the start-year test and the random-pick test before believing a result.
+""")
+    theme.section("Current leaders", "year-to-date")
     this_year = prices[prices.index.year == prices.index[-1].year].drop(columns=[bench], errors="ignore")
     ytd = (this_year.iloc[-1] / this_year.iloc[0] - 1).dropna().sort_values(ascending=False).head(10)
     st.caption("What the strategy would be looking at right now. A description of the past, not a prediction.")
