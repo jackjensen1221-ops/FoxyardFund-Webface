@@ -6,7 +6,7 @@ import streamlit as st
 import data
 import nlp
 from catalog import BENCHMARKS, UNIVERSES
-from engine import RULES, drawdown, metrics, rolling_metrics, run_strategy, start_year_sensitivity
+from engine import RULES, drawdown, factor_attribution, metrics, rolling_metrics, run_strategy
 
 st.set_page_config(
     page_title="Institutional Quantitative Terminal",
@@ -55,7 +55,7 @@ st.markdown("""
 MIN_START = 2005
 PICK_RULES = [k for k in RULES if k != "random"]
 DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MSFT, TSLA, AMZN",
-                bench_key="sp500", custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
+                bench_key="sp500", secondary_benchs=["nasdaq100"], custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
                 top_n=1, initial=10_000, annual_contrib=10_000, stop_pct=15, trailing=False, after_stop="cash",
                 cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True,
                 chart_metric="Portfolio Value ($)", ai_mode=False)
@@ -101,7 +101,7 @@ sb.markdown("---")
 
 # AI Mode Toggle Switch
 sb.subheader("🤖 AI Intelligence")
-sb.toggle("Enable Gemini AI Mode", key="ai_mode", help="Turn on to allow natural language prompts and AI portfolio reviews. Turn off to save your API quota.")
+sb.toggle("Enable Gemini AI Mode", key="ai_mode", help="Turn on for natural language prompts and AI portfolio reviews.")
 
 sb.markdown("---")
 sb.subheader("1. Universe Selection")
@@ -111,9 +111,10 @@ if S["universe"] == "custom":
 elif S["universe"] == "nyse":
     sb.select_slider("Most-traded NYSE stocks", [100, 250, 500, 1000], key="nyse_n")
 
-sb.subheader("2. Benchmark")
+sb.subheader("2. Benchmarks & Multi-Overlay")
 sb.selectbox("Primary Benchmark", list(BENCHMARKS), format_func=lambda k: BENCHMARKS[k]["label"], key="bench_key")
-if S["bench_key"] == "custom":
+sb.multiselect("Secondary Benchmark Overlays", list(BENCHMARKS), format_func=lambda k: BENCHMARKS[k]["label"], key="secondary_benchs")
+if S["bench_key"] == "custom" or "custom" in S["secondary_benchs"]:
     sb.text_input("Custom Benchmark Ticker", key="custom_bench")
 
 sb.subheader("3. Strategy & Allocation")
@@ -136,7 +137,7 @@ sb.number_input("Initial Capital ($)", 100, 10_000_000, step=1000, key="initial"
 sb.number_input("Annual DCA Contribution ($)", 0, 100_000, step=500, key="annual_contrib")
 
 sb.subheader("4. Chart Display Options")
-sb.checkbox("Show Total Invested Principal (No Interest)", key="show_principal")
+sb.checkbox("Show Total Invested Principal", key="show_principal")
 
 sb.subheader("5. Risk Controls & Behavioral Stops")
 sb.slider("Stop-Loss (%)", 0, 50, key="stop_pct")
@@ -150,9 +151,8 @@ sb.slider("Capital Gains Tax Rate (%)", 0, 50, key="tax_pct")
 
 # ---------------- Main Dashboard Layout ----------------
 st.title("📊 Institutional Quantitative Backtest Terminal")
-st.markdown("Advanced multi-asset strategy simulator equipped with optional Gemini AI intelligence and behavioral risk modeling.")
+st.markdown("Advanced multi-asset strategy simulator with multi-benchmark attribution, Gemini AI intelligence, and behavioral risk modeling.")
 
-# Gemini Natural Language Prompt Bar (Only active if AI Mode is toggled ON)
 ai_enabled = S.get("ai_mode", False)
 has_key = bool(get_api_key())
 
@@ -206,6 +206,14 @@ try:
         st.error(f"Invalid benchmark configuration for {bench}.")
         st.stop()
 
+    # Load secondary benchmarks if selected
+    sec_bench_series = {}
+    for sb_key in S["secondary_benchs"]:
+        if sb_key != S["bench_key"]:
+            b_name, b_ser = data.build_benchmark(sb_key, S["custom_bench"], stock_prices if not stock_prices.empty else None)
+            if b_ser is not None:
+                sec_bench_series[b_name] = b_ser
+
     if not stock_prices.empty:
         prices = stock_prices.drop(columns=[bench], errors="ignore")
     else:
@@ -220,7 +228,6 @@ try:
     params = dict(rule=S["rule"], top_n=S["top_n"], stop_pct=S["stop_pct"], trailing=S["trailing"],
                   after_stop=S["after_stop"], cost_bps=S["cost_bps"], tax_rate=S["tax_pct"] / 100,
                   initial=S["initial"], annual_contribution=S["annual_contrib"], custom_weights=custom_weights)
-    initial = S["initial"]
 
     res = run_strategy(prices, bench, start_year, **params)
     if res is None:
@@ -230,19 +237,16 @@ try:
     eq, be, yrs, asset_bd, principal, asset_metrics = res["equity"], res["bench"], res["years"], res["asset_breakdown"], res["principal"], res["asset_metrics"]
     ms, mb = metrics(eq), metrics(be)
     roll = rolling_metrics(eq, be)
+    attribution = factor_attribution(eq, be)
 
     # Top Executive Summary Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Final Portfolio Value", f"${ms['Final value']:,.2f}", f"{ms['CAGR']*100:+.2f}% CAGR")
-    m2.metric("Benchmark Value", f"${mb['Final value']:,.2f}", f"{mb['CAGR']*100:+.2f}% CAGR")
-    m3.metric("Max Drawdown", pct(ms["Max drawdown"]), f"Benchmark: {pct(mb['Max drawdown'])}")
-    
-    bench_sharpe_val = mb.get('Sharpe (rf=0)', 0.0)
-    bench_sharpe_text = f"Benchmark: {bench_sharpe_val:.2f}" if 'Sharpe (rf=0)' in mb else ""
-    strat_sharpe_val = ms.get('Sharpe (rf=0)', 0.0)
-    m4.metric("Sharpe Ratio", f"{strat_sharpe_val:.2f}", bench_sharpe_text)
+    m2.metric(f"Benchmark ({bench})", f"${mb['Final value']:,.2f}", f"{mb['CAGR']*100:+.2f}% CAGR")
+    m3.metric("Alpha vs Benchmark", f"{attribution['Alpha']*100:+.2f}%", f"Beta: {attribution['Beta']:.2f}")
+    m4.metric("Sharpe Ratio", f"{ms.get('Sharpe (rf=0)', 0.0):.2f}", f"Correlation: {attribution['Correlation']:.2f}")
 
-    # Gemini AI Portfolio Review Banner (Only runs if AI Mode is toggled ON)
+    # Gemini AI Portfolio Review Banner
     if ai_enabled and has_key:
         with st.expander("🧠 Gemini AI Quantitative & Behavioral Review", expanded=False):
             with st.spinner("Gemini is analyzing your risk profile and performance..."):
@@ -251,7 +255,7 @@ try:
 
     # Chart Header & Metric Selector Dropdown
     col_hdr, col_drop = st.columns([2, 1])
-    col_hdr.markdown("### Performance Trajectory & Analytics")
+    col_hdr.markdown("### Performance Trajectory & Multi-Benchmark Attribution")
     col_drop.selectbox(
         "Chart Metric View", 
         ["Portfolio Value ($)", "Rolling 1Y CAGR (%)", "Rolling 1Y Volatility (%)", "Drawdown (%)"],
@@ -259,15 +263,24 @@ try:
         label_visibility="collapsed"
     )
     
-    # Professional Plotly Chart Generation
+    # Professional Plotly Chart Generation with Multi-Benchmark Overlays
     fig = go.Figure()
     metric_mode = S["chart_metric"]
 
     if metric_mode == "Portfolio Value ($)":
         fig.add_scatter(x=eq.index, y=eq, name="Strategy Portfolio", line=dict(width=3, color="#2ecc71"))
         if S["show_principal"] and not principal.empty:
-            fig.add_scatter(x=principal.index, y=principal, name="Total Cash Invested (No Interest)", line=dict(width=1.8, dash="dash", color="#e67e22"))
-        fig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
+            fig.add_scatter(x=principal.index, y=principal, name="Total Cash Invested", line=dict(width=1.8, dash="dash", color="#e67e22"))
+        fig.add_scatter(x=be.index, y=be, name=f"Primary Benchmark ({bench})", line=dict(width=1.8, color="#3498db"))
+        
+        # Add secondary benchmark overlays
+        colors = ["#9b59b6", "#e74c3c", "#f1c40f", "#1abc9c"]
+        for idx, (b_name, b_ser) in enumerate(sec_bench_series.items()):
+            col_c = colors[idx % len(colors)]
+            scaled_b = b_ser.reindex(eq.index).ffill()
+            scaled_b = scaled_b / scaled_b.iloc[0] * S["initial"]
+            fig.add_scatter(x=scaled_b.index, y=scaled_b, name=f"Overlay: {b_name}", line=dict(width=1.2, dash="dot", color=col_c))
+            
         yaxis_format = "$"
 
     elif metric_mode == "Rolling 1Y CAGR (%)":
@@ -285,14 +298,6 @@ try:
         fig.add_scatter(x=be.index, y=drawdown(be), name=f"Benchmark Drawdown ({bench})", line=dict(width=1, color="#3498db", dash="dot"))
         yaxis_format = ".0%"
 
-    # Market Crash Annotations
-    crashes = {"2008-09-15": "2008 GFC", "2020-03-16": "COVID Crash", "2022-01-03": "2022 Tightening"}
-    for date_str, label in crashes.items():
-        dt = pd.to_datetime(date_str)
-        if eq.index.min() <= dt <= eq.index.max():
-            fig.add_vline(x=dt, line_dash="dash", line_color="rgba(255,255,255,0.3)")
-            fig.add_annotation(x=dt, y=eq.max() if metric_mode == "Portfolio Value ($)" else 0, text=label, showarrow=False, font=dict(color="gray", size=10))
-
     fig.update_layout(
         template="plotly_dark",
         height=480,
@@ -304,11 +309,11 @@ try:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Detailed Tabs including Behavioral Psychology Coach
+    # Detailed Tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📋 Annual Breakdown", 
         "📊 Asset Return Breakdown", 
-        "📉 Risk Analytics", 
+        "📈 Factor Attribution", 
         "🧠 Behavioral Risk Coach",
         "ℹ️ Methodology"
     ])
@@ -324,15 +329,19 @@ try:
             st.info("No individual asset metrics available for this rule configuration.")
 
     with tab3:
-        dfig = go.Figure()
-        dfig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy Drawdown", line=dict(color="#e74c3c", width=1.2), fill="tozeroy")
-        dfig.update_layout(template="plotly_dark", height=300, yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(dfig, use_container_width=True)
+        st.markdown("### Quantitative Factor Attribution & Regression Analysis")
+        st.markdown("Evaluating whether strategy outperformance stems from true stock selection skill (Alpha) or broader systemic market exposure (Beta).")
+        
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Annualized Alpha", f"{attribution['Alpha']*100:+.2f}%")
+        f2.metric("Portfolio Beta", f"{attribution['Beta']:.2f}")
+        f3.metric("R-Squared (R²)", f"{attribution['R-squared']:.2f}")
+        f4.metric("Pearson Correlation", f"{attribution['Correlation']:.2f}")
+        
+        st.info("💡 **Interpretation:** A Beta close to 1.0 indicates your strategy moves in lockstep with the benchmark. A high Alpha with a moderate Beta signifies true risk-adjusted excess returns.")
 
     with tab4:
         st.markdown("### Behavioral Finance & Emotional Vulnerability Audit")
-        st.markdown("Quantitative models assume rational actors, but human investors suffer from cognitive biases. Here is how your psychological risk profile looks under this strategy:")
-        
         max_dd = abs(ms["Max drawdown"])
         vol = ms["Volatility"]
         
@@ -368,10 +377,10 @@ try:
 
     with tab5:
         st.markdown("""
+        * **Multi-Benchmark Overlays:** Overlay multiple benchmark series (S&P 500, Nasdaq, Russell, Bonds) simultaneously onto the main trajectory chart.
+        * **Factor Attribution:** Calculates Alpha, Beta, R², and correlation via daily return linear regression against the primary benchmark.
         * **AI Mode Toggle:** Keeps your Gemini API quota protected by disabling AI calls unless explicitly toggled on.
         * **Behavioral Audit:** Flags cognitive bias triggers (loss aversion, panic-selling thresholds, and volatility fatigue).
-        * **Asset Breakdown:** Calculates annualized CAGR and ending value for each individual asset across the tested timeframe.
-        * **Rolling Metrics:** Calculates 1-year (252 trading day) rolling compound returns and annualized volatility.
         """)
 
 except Exception as e:
