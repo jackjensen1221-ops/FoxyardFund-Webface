@@ -207,7 +207,7 @@ try:
         st.error("Insufficient historical data for selected start year.")
         st.stop()
         
-    eq, be, yrs, asset_bd, principal = res["equity"], res["bench"], res["years"], res["asset_breakdown"], res["principal"]
+    eq, be, yrs, asset_bd, principal, asset_metrics = res["equity"], res["bench"], res["years"], res["asset_breakdown"], res["principal"], res["asset_metrics"]
     ms, mb = metrics(eq), metrics(be)
     roll = rolling_metrics(eq, be)
 
@@ -232,7 +232,7 @@ try:
         label_visibility="collapsed"
     )
     
-    # Professional Plotly Chart Generation based on Dropdown Selection
+    # Professional Plotly Chart Generation
     fig = go.Figure()
     metric_mode = S["chart_metric"]
 
@@ -240,7 +240,7 @@ try:
         fig.add_scatter(x=eq.index, y=eq, name="Strategy Portfolio", line=dict(width=3, color="#2ecc71"))
         if S["show_principal"] and not principal.empty:
             fig.add_scatter(x=principal.index, y=principal, name="Total Cash Invested (No Interest)", line=dict(width=1.8, dash="dash", color="#e67e22"))
-        fig.add_scatters = fig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
+        fig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
         yaxis_format = "$"
 
     elif metric_mode == "Rolling 1Y CAGR (%)":
@@ -277,23 +277,30 @@ try:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Detailed Tabs
-    tab1, tab2, tab3 = st.tabs(["📋 Annual Breakdown", "📉 Risk Analytics", "ℹ️ Methodology"])
+    # Detailed Tabs (Including Asset Return Breakdown Table)
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 Annual Breakdown", "📊 Asset Return Breakdown", "📉 Risk Analytics", "ℹ️ Methodology"])
     
     with tab1:
         st.dataframe(yrs.style.format({"Year": "{:d}", "Strategy": "{:+.1%}", "Benchmark": "{:+.1%}", "Tax paid": "${:,.0f}"}), use_container_width=True)
         
     with tab2:
+        st.markdown("#### Individual Asset Return & CAGR Summary")
+        if not asset_metrics.empty:
+            st.dataframe(asset_metrics.style.format({"Final Value ($)": "${:,.2f}", "Annualized CAGR": "{:+.2%}"}), use_container_width=True)
+        else:
+            st.info("No individual asset metrics available for this rule configuration.")
+
+    with tab3:
         dfig = go.Figure()
         dfig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy Drawdown", line=dict(color="#e74c3c", width=1.2), fill="tozeroy")
         dfig.update_layout(template="plotly_dark", height=300, yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(dfig, use_container_width=True)
 
-    with tab3:
+    with tab4:
         st.markdown("""
+        * **Asset Breakdown:** Calculates annualized CAGR and ending value for each individual asset across the tested timeframe.
         * **Rolling Metrics:** Calculates 1-year (252 trading day) rolling compound returns and annualized volatility.
         * **Principal Tracking:** Shows cumulative out-of-pocket cash contributed (Initial Capital + Annual DCA) without market returns.
-        * **Rebalancing & Frictions:** Executed annually with transaction fees and tax drag modeled.
         """)
 
 except Exception as e:
