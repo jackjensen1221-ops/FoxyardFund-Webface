@@ -1,4 +1,4 @@
-"""Backtest engine: pure pandas, no Streamlit, supporting multi-asset tracking and cash holdings."""
+"""Backtest engine: pure pandas, no Streamlit, supporting principal accumulation tracking."""
 import numpy as np
 import pandas as pd
 
@@ -13,7 +13,6 @@ RULES = {
 
 
 def _signal(rule, prices, stocks, yr, y, rng):
-    """Score every stock using ONLY data from before the first trading day of year y."""
     first_day = prices.index[yr == y][0]
     if rule in ("prior_year_winner", "prior_year_loser"):
         prev = prices.loc[yr == y - 1, stocks]
@@ -45,8 +44,10 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
         rng = np.random.default_rng(seed)
         cost = cost_bps / 10_000
         capital, carry = float(initial), 0.0
-        segs, rows, asset_segs = [], [], []
+        segs, rows, asset_segs, principal_segs = [], [], [], []
         last_year = yr[-1]
+        
+        running_principal = float(initial)
 
         for y in range(start_year, last_year + 1):
             cur = prices[yr == y]
@@ -78,7 +79,6 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
             vals, stopped = [], []
             individual_paths = {}
             
-            # Handle pure cash allocation if no stocks picked or 100% cash weight
             cash_weight = weights.get("CASH", 0.0) if "CASH" in weights else 0.0
             stock_weight_mult = 1.0 - cash_weight
 
@@ -104,18 +104,20 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
                 vals.append(weighted_path)
                 individual_paths[t] = weighted_path * capital
 
-            # Add Cash component if applicable
             if cash_weight > 0:
                 cash_path = pd.Series(1.0, index=cur.index) * cash_weight
                 vals.append(cash_path)
                 individual_paths["CASH"] = cash_path * capital
 
             if not vals:
-                # 100% cash fallback if everything else fails
                 port = pd.Series(1.0, index=cur.index) * capital
                 individual_paths["CASH"] = port
             else:
                 port = pd.concat(vals, axis=1).sum(axis=1) * capital
+
+            # Principal accumulation tracking (flat line per year representing out-of-pocket cash put in)
+            prin_series = pd.Series(running_principal, index=cur.index)
+            principal_segs.append(prin_series)
 
             tax_paid = 0.0
             if y < last_year:
@@ -126,6 +128,7 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
                 else:
                     carry = taxable
                 port.iloc[-1] = (end_val - tax_paid) + annual_contribution
+                running_principal += annual_contribution
 
             segs.append(port)
             asset_segs.append(pd.DataFrame(individual_paths))
@@ -145,12 +148,14 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
             return None
         equity = pd.concat(segs)
         asset_breakdown = pd.concat(asset_segs).reindex(equity.index).ffill()
+        principal_curve = pd.concat(principal_segs).reindex(equity.index).ffill()
         b = prices[bench].reindex(equity.index).ffill()
         return {
             "equity": equity, 
             "bench": b / b.iloc[0] * initial, 
             "years": pd.DataFrame(rows),
-            "asset_breakdown": asset_breakdown
+            "asset_breakdown": asset_breakdown,
+            "principal": principal_curve
         }
     except Exception as e:
         print(f"Strategy execution error: {e}")
