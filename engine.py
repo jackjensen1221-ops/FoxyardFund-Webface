@@ -71,10 +71,42 @@ def rolling_metrics(eq, be):
         "bench_vol": bench_vol.dropna()
     }
 
+def run_custom_fund(prices, weights_dict, start_year, initial=10000.0, annual_contribution=10000.0):
+    df = prices.loc[prices.index.year >= start_year].copy()
+    if df.empty:
+        return None
+    valid_weights = {t: w for t, w in weights_dict.items() if t in df.columns and w > 0}
+    if not valid_weights:
+        return None
+    total_w = sum(valid_weights.values())
+    norm_weights = {t: w / total_w for t, w in valid_weights.items()}
+    dates = df.index
+    rets = df[list(norm_weights.keys())].pct_change().fillna(0.0)
+    fund_val = float(initial)
+    total_invested = float(initial)
+    fund_vals = [fund_val]
+    prin_vals = [total_invested]
+    last_year = dates[0].year
+    for i in range(1, len(dates)):
+        dt = dates[i]
+        curr_year = dt.year
+        if curr_year != last_year:
+            total_invested += annual_contribution
+            fund_val += annual_contribution
+            last_year = curr_year
+        day_ret = sum(rets.loc[dt, t] * w for t, w in norm_weights.items())
+        fund_val = fund_val * (1.0 + day_ret)
+        fund_vals.append(fund_val)
+        prin_vals.append(total_invested)
+    return {
+        "equity": pd.Series(fund_vals, index=dates),
+        "principal": pd.Series(prin_vals, index=dates),
+        "weights": norm_weights
+    }
+
 def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top_n=1,
                  stop_pct=15, trailing=False, after_stop="cash", cost_bps=5, tax_rate=0.0,
                  initial=10000.0, annual_contribution=10000.0, custom_weights=None, reinvest_dividends=True):
-    """Backtesting loop with dividend reinvestment (DRIP) toggle and DCA support."""
     if prices.empty:
         return None
     df = prices.loc[prices.index.year >= start_year].copy()
@@ -145,9 +177,8 @@ def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top
         if np.isnan(s_ret):
             s_ret = 0.0
             
-        # If dividends are NOT reinvested (DRIP off), adjust return slightly to simulate cash payout instead of DRIP compounding
         if not reinvest_dividends:
-            s_ret -= 0.000075  # ~1.9% annualized dividend yield offset retained as cash
+            s_ret -= 0.000075
 
         if curr_year != last_year:
             s_ret -= (cost_bps / 10000.0)
