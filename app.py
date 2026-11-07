@@ -161,14 +161,16 @@ try:
     eq, be, yrs = res["equity"], res["bench"], res["years"]
     ms, mb = metrics(eq), metrics(be)
 
-    # Top Executive Summary Metrics
+    # Top Executive Summary Metrics (Safe parsing)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Final Portfolio Value", f"${ms['Final value']:,.2f}", f"{ms['CAGR']*100:+.2f}% CAGR")
     m2.metric("Benchmark Value", f"${mb['Final value']:,.2f}", f"{mb['CAGR']*100:+.2f}% CAGR")
     m3.metric("Max Drawdown", pct(ms["Max drawdown"]), f"Benchmark: {pct(mb['Max drawdown'])}")
     
-    bench_sharpe_text = f"Benchmark: {mb.get('Sharpe (rf=0)', 0):.2f}" if 'Sharpe (rf=0)' in mb else ""
-    m4.metric("Sharpe Ratio", f"{ms['Sharpe (rf=0)]:.2f}", bench_sharpe_text)
+    bench_sharpe_val = mb.get('Sharpe (rf=0)', 0.0)
+    bench_sharpe_text = f"Benchmark: {bench_sharpe_val:.2f}" if 'Sharpe (rf=0)' in mb else ""
+    strat_sharpe_val = ms.get('Sharpe (rf=0)', 0.0)
+    m4.metric("Sharpe Ratio", f"{strat_sharpe_val:.2f}", bench_sharpe_text)
 
     st.markdown("### Performance Trajectory")
     
