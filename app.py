@@ -9,7 +9,7 @@ from catalog import BENCHMARKS, UNIVERSES
 from engine import RULES, drawdown, metrics, rolling_metrics, run_strategy, start_year_sensitivity
 
 st.set_page_config(
-    page_title="Institutional Portfolio Backtest Terminal",
+    page_title="Institutional Quantitative Terminal",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -42,6 +42,13 @@ st.markdown("""
         border-radius: 10px;
         margin-bottom: 20px;
     }
+    .psych-card {
+        background-color: #1f1a1d;
+        border-left: 4px solid #e74c3c;
+        padding: 15px;
+        border-radius: 4px;
+        margin-bottom: 15px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -63,9 +70,9 @@ def pct(x):
 
 def get_api_key():
     try:
-        return st.secrets["ANTHROPIC_API_KEY"]
+        return st.secrets["GEMINI_API_KEY"] or st.secrets["GOOGLE_API_KEY"]
     except Exception:
-        return os.environ.get("ANTHROPIC_API_KEY")
+        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
 def apply_nl():
@@ -82,7 +89,7 @@ def apply_nl():
             S[k] = v
         S["nl_msg"] = ("ok", out["explanation"], out["unsupported"])
     except Exception as e:
-        S["nl_msg"] = ("error", f"Couldn't read that prompt: {e}", "")
+        S["nl_msg"] = ("error", f"Couldn't parse prompt with Gemini: {e}", "")
 
 
 # ---------------- Sidebar Controls ----------------
@@ -124,7 +131,7 @@ sb.number_input("Annual DCA Contribution ($)", 0, 100_000, step=500, key="annual
 sb.subheader("4. Chart Display Options")
 sb.checkbox("Show Total Invested Principal (No Interest)", key="show_principal")
 
-sb.subheader("5. Risk Controls")
+sb.subheader("5. Risk Controls & Behavioral Stops")
 sb.slider("Stop-Loss (%)", 0, 50, key="stop_pct")
 sb.checkbox("Trailing Stop-Loss", key="trailing")
 sb.radio("Post-Stop Allocation", ["cash", "benchmark"], key="after_stop",
@@ -135,28 +142,29 @@ sb.slider("Execution Cost (bps)", 0, 50, key="cost_bps")
 sb.slider("Capital Gains Tax Rate (%)", 0, 50, key="tax_pct")
 
 # ---------------- Main Dashboard Layout ----------------
-st.title("📊 Quantitative Portfolio Backtest Terminal")
-st.markdown("Institutional-grade multi-asset strategy simulation and benchmark comparison engine.")
+st.title("📊 Institutional Quantitative Backtest Terminal")
+st.markdown("Advanced multi-asset strategy simulator equipped with Gemini AI intelligence and behavioral risk modeling.")
 
+# Gemini Natural Language Prompt Bar
 has_key = bool(get_api_key())
 col_in, col_btn = st.columns([6, 1], vertical_alignment="bottom")
 col_in.text_input(
-    "AI Strategy Prompt", 
+    "Gemini AI Strategy Prompt", 
     key="nl_text", 
     disabled=not has_key, 
     label_visibility="collapsed",
-    placeholder="e.g., Buy momentum stocks with $10k initial and $5k annual DCA"
+    placeholder="e.g., Backtest momentum stocks starting in 2015 with a 15% stop loss"
 )
-col_btn.button("Run Prompt", on_click=apply_nl, type="primary", disabled=not has_key)
+col_btn.button("Run AI Prompt", on_click=apply_nl, type="primary", disabled=not has_key)
 
 if not has_key:
-    st.caption("💡 *To enable AI prompts, add your `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml`.*")
+    st.caption("💡 *To enable Gemini AI prompts, add your `GEMINI_API_KEY` to `.streamlit/secrets.toml`.*")
 
 msg = S.get("nl_msg")
 if msg:
     kind, text, extra = msg
     if kind == "ok":
-        st.success(f"🤖 **AI Scenario Applied:** {text}")
+        st.success(f"🤖 **Gemini AI Applied:** {text}")
     else:
         st.error(text)
     if extra:
@@ -222,6 +230,13 @@ try:
     strat_sharpe_val = ms.get('Sharpe (rf=0)', 0.0)
     m4.metric("Sharpe Ratio", f"{strat_sharpe_val:.2f}", bench_sharpe_text)
 
+    # Gemini AI Portfolio Review Banner
+    if has_key:
+        with st.expander("🧠 Gemini AI Quantitative & Behavioral Review", expanded=False):
+            with st.spinner("Gemini is analyzing your risk profile and performance..."):
+                ai_review = nlp.generate_ai_commentary(ms, RULES.get(S["rule"], S["rule"]), get_api_key())
+                st.markdown(ai_review)
+
     # Chart Header & Metric Selector Dropdown
     col_hdr, col_drop = st.columns([2, 1])
     col_hdr.markdown("### Performance Trajectory & Analytics")
@@ -277,8 +292,14 @@ try:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Detailed Tabs (Including Asset Return Breakdown Table)
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Annual Breakdown", "📊 Asset Return Breakdown", "📉 Risk Analytics", "ℹ️ Methodology"])
+    # Detailed Tabs including Behavioral Psychology Coach
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📋 Annual Breakdown", 
+        "📊 Asset Return Breakdown", 
+        "📉 Risk Analytics", 
+        "🧠 Behavioral Risk Coach",
+        "ℹ️ Methodology"
+    ])
     
     with tab1:
         st.dataframe(yrs.style.format({"Year": "{:d}", "Strategy": "{:+.1%}", "Benchmark": "{:+.1%}", "Tax paid": "${:,.0f}"}), use_container_width=True)
@@ -297,10 +318,49 @@ try:
         st.plotly_chart(dfig, use_container_width=True)
 
     with tab4:
+        st.markdown("### Behavioral Finance & Emotional Vulnerability Audit")
+        st.markdown("Quantitative models assume rational actors, but human investors suffer from cognitive biases. Here is how your psychological risk profile looks under this strategy:")
+        
+        max_dd = abs(ms["Max drawdown"])
+        vol = ms["Volatility"]
+        
+        # Dynamic Behavioral Warnings
+        if max_dd > 0.30:
+            st.markdown(f"""
+            <div class="psych-card">
+                <h4>⚠️ Severe Loss Aversion Trigger (Max Drawdown: {max_dd:.1%})</h4>
+                <p>This strategy experienced a peak-to-trough decline greater than 30%. Behavioral research shows that retail and institutional investors alike experience acute panic selling when losses cross 25%, frequently locking in permanent capital destruction near the market bottom. Ensure your stop-loss or psychological fortitude matches this volatility.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="background-color: #162621; border-left: 4px solid #2ecc71; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
+                <h4 style="color: #2ecc71;">✅ Moderate Drawdown Envelope (Max Drawdown: {max_dd:.1%})</h4>
+                <p>Your drawdown remains within historically manageable thresholds, significantly reducing the probability of emotional panic-selling during market contractions.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+        if vol > 0.25:
+            st.markdown(f"""
+            <div class="psych-card">
+                <h4>⚠️ High Volatility & Recency Bias Risk (Volatility: {vol:.1%})</h4>
+                <p>High annualized volatility often induces recency bias—chasing recent winners and abandoning discipline after a single bad month. Consider adding fixed cash reserves or defensive assets to smooth out the emotional ride.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="background-color: #162621; border-left: 4px solid #2ecc71; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
+                <h4 style="color: #2ecc71;">✅ Stable Volatility Profile (Volatility: {vol:.1%})</h4>
+                <p>The return stream is relatively steady, supporting long-term adherence without triggering obsessive portfolio checking.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with tab5:
         st.markdown("""
+        * **Gemini AI Integration:** Natural language prompts and automated portfolio reviews powered by Google Gemini.
+        * **Behavioral Audit:** Flags cognitive bias triggers (loss aversion, panic-selling thresholds, and volatility fatigue).
         * **Asset Breakdown:** Calculates annualized CAGR and ending value for each individual asset across the tested timeframe.
         * **Rolling Metrics:** Calculates 1-year (252 trading day) rolling compound returns and annualized volatility.
-        * **Principal Tracking:** Shows cumulative out-of-pocket cash contributed (Initial Capital + Annual DCA) without market returns.
         """)
 
 except Exception as e:
