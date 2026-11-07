@@ -58,7 +58,7 @@ DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MS
                 bench_key="sp500", custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
                 top_n=1, initial=10_000, annual_contrib=10_000, stop_pct=15, trailing=False, after_stop="cash",
                 cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True,
-                chart_metric="Portfolio Value ($)")
+                chart_metric="Portfolio Value ($)", ai_mode=False)
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 S = st.session_state
@@ -76,6 +76,8 @@ def get_api_key():
 
 
 def apply_nl():
+    if not S.get("ai_mode", False):
+        return
     text = S.get("nl_text", "").strip()
     if not text:
         return
@@ -97,6 +99,11 @@ sb = st.sidebar
 sb.title("⚙️ Terminal Config")
 sb.markdown("---")
 
+# AI Mode Toggle Switch
+sb.subheader("🤖 AI Intelligence")
+sb.toggle("Enable Gemini AI Mode", key="ai_mode", help="Turn on to allow natural language prompts and AI portfolio reviews. Turn off to save your API quota.")
+
+sb.markdown("---")
 sb.subheader("1. Universe Selection")
 sb.selectbox("Asset Universe", list(UNIVERSES), format_func=UNIVERSES.get, key="universe")
 if S["universe"] == "custom":
@@ -143,25 +150,30 @@ sb.slider("Capital Gains Tax Rate (%)", 0, 50, key="tax_pct")
 
 # ---------------- Main Dashboard Layout ----------------
 st.title("📊 Institutional Quantitative Backtest Terminal")
-st.markdown("Advanced multi-asset strategy simulator equipped with Gemini AI intelligence and behavioral risk modeling.")
+st.markdown("Advanced multi-asset strategy simulator equipped with optional Gemini AI intelligence and behavioral risk modeling.")
 
-# Gemini Natural Language Prompt Bar
+# Gemini Natural Language Prompt Bar (Only active if AI Mode is toggled ON)
+ai_enabled = S.get("ai_mode", False)
 has_key = bool(get_api_key())
+
 col_in, col_btn = st.columns([6, 1], vertical_alignment="bottom")
+prompt_disabled = not ai_enabled or not has_key
 col_in.text_input(
     "Gemini AI Strategy Prompt", 
     key="nl_text", 
-    disabled=not has_key, 
+    disabled=prompt_disabled, 
     label_visibility="collapsed",
-    placeholder="e.g., Backtest momentum stocks starting in 2015 with a 15% stop loss"
+    placeholder="Enable 'Gemini AI Mode' in sidebar to use natural language prompts..." if not ai_enabled else "e.g., Backtest momentum stocks starting in 2015 with a 15% stop loss"
 )
-col_btn.button("Run AI Prompt", on_click=apply_nl, type="primary", disabled=not has_key)
+col_btn.button("Run AI Prompt", on_click=apply_nl, type="primary", disabled=prompt_disabled)
 
-if not has_key:
-    st.caption("💡 *To enable Gemini AI prompts, add your `GEMINI_API_KEY` to `.streamlit/secrets.toml`.*")
+if ai_enabled and not has_key:
+    st.caption("💡 *AI Mode is ON, but your `GEMINI_API_KEY` is missing from Streamlit secrets.*")
+elif not ai_enabled:
+    st.caption("💤 *AI Mode is OFF (Quota Protected). Toggle it on in the sidebar whenever you want to use AI prompts.*")
 
 msg = S.get("nl_msg")
-if msg:
+if msg and ai_enabled:
     kind, text, extra = msg
     if kind == "ok":
         st.success(f"🤖 **Gemini AI Applied:** {text}")
@@ -230,8 +242,8 @@ try:
     strat_sharpe_val = ms.get('Sharpe (rf=0)', 0.0)
     m4.metric("Sharpe Ratio", f"{strat_sharpe_val:.2f}", bench_sharpe_text)
 
-    # Gemini AI Portfolio Review Banner
-    if has_key:
+    # Gemini AI Portfolio Review Banner (Only runs if AI Mode is toggled ON)
+    if ai_enabled and has_key:
         with st.expander("🧠 Gemini AI Quantitative & Behavioral Review", expanded=False):
             with st.spinner("Gemini is analyzing your risk profile and performance..."):
                 ai_review = nlp.generate_ai_commentary(ms, RULES.get(S["rule"], S["rule"]), get_api_key())
@@ -324,19 +336,18 @@ try:
         max_dd = abs(ms["Max drawdown"])
         vol = ms["Volatility"]
         
-        # Dynamic Behavioral Warnings
         if max_dd > 0.30:
             st.markdown(f"""
             <div class="psych-card">
                 <h4>⚠️ Severe Loss Aversion Trigger (Max Drawdown: {max_dd:.1%})</h4>
-                <p>This strategy experienced a peak-to-trough decline greater than 30%. Behavioral research shows that retail and institutional investors alike experience acute panic selling when losses cross 25%, frequently locking in permanent capital destruction near the market bottom. Ensure your stop-loss or psychological fortitude matches this volatility.</p>
+                <p>This strategy experienced a peak-to-trough decline greater than 30%. Behavioral research shows that investors experience acute panic selling when losses cross 25%. Ensure your stop-loss or psychological fortitude matches this volatility.</p>
             </div>
             """, unsafe_allow_html=True)
         else:
             st.markdown(f"""
             <div style="background-color: #162621; border-left: 4px solid #2ecc71; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
                 <h4 style="color: #2ecc71;">✅ Moderate Drawdown Envelope (Max Drawdown: {max_dd:.1%})</h4>
-                <p>Your drawdown remains within historically manageable thresholds, significantly reducing the probability of emotional panic-selling during market contractions.</p>
+                <p>Your drawdown remains within historically manageable thresholds, reducing the probability of emotional panic-selling.</p>
             </div>
             """, unsafe_allow_html=True)
 
@@ -344,7 +355,7 @@ try:
             st.markdown(f"""
             <div class="psych-card">
                 <h4>⚠️ High Volatility & Recency Bias Risk (Volatility: {vol:.1%})</h4>
-                <p>High annualized volatility often induces recency bias—chasing recent winners and abandoning discipline after a single bad month. Consider adding fixed cash reserves or defensive assets to smooth out the emotional ride.</p>
+                <p>High annualized volatility often induces recency bias—chasing recent winners and abandoning discipline after a single bad month.</p>
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -357,7 +368,7 @@ try:
 
     with tab5:
         st.markdown("""
-        * **Gemini AI Integration:** Natural language prompts and automated portfolio reviews powered by Google Gemini.
+        * **AI Mode Toggle:** Keeps your Gemini API quota protected by disabling AI calls unless explicitly toggled on.
         * **Behavioral Audit:** Flags cognitive bias triggers (loss aversion, panic-selling thresholds, and volatility fatigue).
         * **Asset Breakdown:** Calculates annualized CAGR and ending value for each individual asset across the tested timeframe.
         * **Rolling Metrics:** Calculates 1-year (252 trading day) rolling compound returns and annualized volatility.
