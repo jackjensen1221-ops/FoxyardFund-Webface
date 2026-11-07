@@ -7,7 +7,7 @@ import streamlit as st
 import data
 import nlp
 from catalog import BENCHMARKS, UNIVERSES
-from engine import RULES, drawdown, factor_attribution, metrics, rolling_metrics, run_strategy
+from engine import RULES, drawdown, factor_attribution, metrics, rolling_metrics, run_strategy, run_custom_fund
 
 st.set_page_config(
     page_title="Institutional Quantitative Terminal",
@@ -44,7 +44,7 @@ PICK_RULES = [k for k in RULES if k != "random"]
 DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MSFT, TSLA, AMZN",
                 bench_key="sp500", secondary_benchs=["nasdaq100"], custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
                 top_n=1, initial=10_000, annual_contrib=10_000, stop_pct=15, trailing=False, after_stop="cash",
-                cost_bps=5, tax_pct=0, reinvest_dividends=True, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True,
+                cost_bps=5, tax_pct=0, reinvest_dividends=False, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True,
                 chart_metric="Portfolio Value ($)", ai_mode=False, fund_name="Apex Alpha Growth Fund",
                 fund_tickers="AAPL, NVDA, MSFT, AMZN, GOOGL")
 for k, v in DEFAULTS.items():
@@ -82,7 +82,7 @@ def apply_nl():
         S["nl_msg"] = ("error", f"Couldn't parse prompt with Gemini: {e}", "")
 
 
-# ---------------- Decluttered Sidebar Controls ----------------
+# ---------------- Sidebar Controls ----------------
 sb = st.sidebar
 sb.title("⚙️ Terminal Config")
 sb.markdown("---")
@@ -110,12 +110,12 @@ with sb.expander("🛡️ Risk & Friction Controls", expanded=False):
     sb.slider("Stop-Loss (%)", 0, 50, key="stop_pct")
     sb.checkbox("Trailing Stop-Loss", key="trailing")
     sb.slider("Execution Cost (bps)", 0, 50, key="cost_bps")
-    sb.checkbox("Reinvest Dividends (DRIP)", key="reinvest_dividends")
+    sb.checkbox("Reinvest Dividends (DRIP)", key="reinvest_dividends", help="Toggle off to payouts as un-reinvested cash stream.")
     sb.checkbox("Show Invested Principal", key="show_principal")
 
 # ---------------- Main Dashboard Layout ----------------
 st.title("📊 Institutional Quantitative Terminal")
-st.markdown("Advanced multi-asset strategy simulator with multi-benchmark attribution, custom fund architect, and behavioral risk auditing.")
+st.markdown("Advanced multi-asset strategy simulator with dividend payout tracking, custom mutual fund sandbox, and multi-benchmark attribution.")
 
 ai_enabled = S.get("ai_mode", False)
 has_key = bool(get_api_key())
@@ -168,15 +168,16 @@ try:
         st.stop()
         
     eq, be, yrs, asset_bd, principal, asset_metrics = res["equity"], res["bench"], res["years"], res["asset_breakdown"], res["principal"], res["asset_metrics"]
+    div_curve, annual_divs, total_cash_divs = res["dividend_curve"], res["annual_dividends"], res["total_cash_dividends"]
     ms, mb = metrics(eq), metrics(be)
     roll = rolling_metrics(eq, be)
     attribution = factor_attribution(eq, be)
 
     # Executive Summary Metrics
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Portfolio Value", f"${ms['Final value']:,.2f}", f"{ms['CAGR']*100:+.2f}% CAGR")
+    m1.metric("Stock Equity Value", f"${ms['Final value']:,.2f}", f"{ms['CAGR']*100:+.2f}% CAGR")
     m2.metric(f"Benchmark ({bench})", f"${mb['Final value']:,.2f}", f"{mb['CAGR']*100:+.2f}% CAGR")
-    m3.metric("Alpha vs Benchmark", f"{attribution['Alpha']*100:+.2f}%", f"Beta: {attribution['Beta']:.2f}")
+    m3.metric("Un-reinvested Cash Dividends", f"${total_cash_divs:,.2f}", "Accumulated Cash" if not S["reinvest_dividends"] else "Reinvested (DRIP)")
     m4.metric("Sharpe Ratio", f"{ms.get('Sharpe (rf=0)', 0.0):.2f}", f"Corr: {attribution['Correlation']:.2f}")
 
     if ai_enabled and has_key:
@@ -193,7 +194,9 @@ try:
     metric_mode = S["chart_metric"]
 
     if metric_mode == "Portfolio Value ($)":
-        fig.add_scatter(x=eq.index, y=eq, name="Strategy", line=dict(width=3, color="#2ecc71"))
+        fig.add_scatter(x=eq.index, y=eq, name="Strategy Stock Equity", line=dict(width=3, color="#2ecc71"))
+        if not S["reinvest_dividends"]:
+            fig.add_scatter(x=eq.index, y=eq + div_curve, name="Total Wealth (Equity + Cash Dividends)", line=dict(width=2, color="#f1c40f", dash="dot"))
         if S["show_principal"] and not principal.empty:
             fig.add_scatter(x=principal.index, y=principal, name="Principal Invested", line=dict(width=1.5, dash="dash", color="#e67e22"))
         fig.add_scatter(x=be.index, y=be, name=f"Primary Benchmark ({bench})", line=dict(width=1.8, color="#3498db"))
@@ -217,10 +220,34 @@ try:
     fig.update_layout(template="plotly_dark", height=440, margin=dict(l=20, r=20, t=10, b=10), hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig, use_container_width=True)
 
-    # Streamlined 4-Tab Layout
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Annual & Asset Breakdown", "📈 Factor Attribution", "🏗️ Mutual Fund Architect", "🧠 Behavioral Risk Coach"])
-    
+    # 5-Tab Layout featuring the new "💰 Dividend Cash Income" tab
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "💰 Dividend Cash Income",
+        "📋 Annual & Asset Breakdown", 
+        "📈 Factor Attribution", 
+        "🏗️ Mutual Fund Architect", 
+        "🧠 Behavioral Risk Coach"
+    ])
+
     with tab1:
+        st.markdown("### 💰 Dividend Cash Payout & Income Stream Analysis")
+        st.markdown("Tracking cash generated from un-reinvested dividends over time.")
+        
+        d_col1, d_col2, d_col3 = st.columns(3)
+        last_yr_div = annual_divs["Annual Dividend Income ($)"].iloc[-1] if not annual_divs.empty else 0.0
+        d_col1.metric("Total Cumulative Cash Payout", f"${total_cash_divs:,.2f}")
+        d_col2.metric("Latest Annual Cash Income", f"${last_yr_div:,.2f}")
+        d_col3.metric("Est. Monthly Cash Stream", f"${last_yr_div / 12:,.2f}")
+
+        div_fig = go.Figure()
+        div_fig.add_scatter(x=div_curve.index, y=div_curve, name="Cumulative Dividend Cash", line=dict(width=3, color="#f1c40f"), fill="tozeroy")
+        div_fig.update_layout(template="plotly_dark", height=320, title="Cumulative Cash Dividends Collected ($)", yaxis_tickprefix="$")
+        st.plotly_chart(div_fig, use_container_width=True)
+        
+        st.markdown("#### Annual Cash Payout Breakdown")
+        st.dataframe(annual_divs.style.format({"Year": "{:d}", "Annual Dividend Income ($)": "${:,.2f}"}), use_container_width=True)
+
+    with tab2:
         c_t1, c_t2 = st.columns(2)
         with c_t1:
             st.markdown("#### Annual Performance Table")
@@ -232,16 +259,15 @@ try:
             else:
                 st.info("No asset metrics available for this rule configuration.")
 
-    with tab2:
+    with tab3:
         st.markdown("### Quantitative Factor Regression")
         f1, f2, f3, f4 = st.columns(4)
         f1.metric("Alpha", f"{attribution['Alpha']*100:+.2f}%")
         f2.metric("Beta", f"{attribution['Beta']:.2f}")
         f3.metric("R-Squared (R²)", f"{attribution['R-squared']:.2f}")
         f4.metric("Correlation", f"{attribution['Correlation']:.2f}")
-        st.info("💡 **Note:** Alpha measures excess return independent of broad market beta exposure.")
 
-    with tab3:
+    with tab4:
         st.markdown("### Custom Mutual Fund Sandbox")
         fm1, fm2 = st.columns([2, 3])
         fm1.text_input("Fund Name", key="fund_name")
@@ -273,7 +299,7 @@ try:
                     ffig.update_layout(template="plotly_dark", height=320, margin=dict(l=20, r=20, t=10, b=10), yaxis_tickprefix="$")
                     st.plotly_chart(ffig, use_container_width=True)
 
-    with tab4:
+    with tab5:
         st.markdown("### Behavioral Risk & Emotional Vulnerability Audit")
         max_dd = abs(ms["Max drawdown"])
         vol = ms["Volatility"]
