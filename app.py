@@ -206,7 +206,6 @@ try:
         st.error(f"Invalid benchmark configuration for {bench}.")
         st.stop()
 
-    # Load secondary benchmarks if selected
     sec_bench_series = {}
     for sb_key in S["secondary_benchs"]:
         if sb_key != S["bench_key"]:
@@ -246,14 +245,12 @@ try:
     m3.metric("Alpha vs Benchmark", f"{attribution['Alpha']*100:+.2f}%", f"Beta: {attribution['Beta']:.2f}")
     m4.metric("Sharpe Ratio", f"{ms.get('Sharpe (rf=0)', 0.0):.2f}", f"Correlation: {attribution['Correlation']:.2f}")
 
-    # Gemini AI Portfolio Review Banner
     if ai_enabled and has_key:
         with st.expander("🧠 Gemini AI Quantitative & Behavioral Review", expanded=False):
             with st.spinner("Gemini is analyzing your risk profile and performance..."):
                 ai_review = nlp.generate_ai_commentary(ms, RULES.get(S["rule"], S["rule"]), get_api_key())
                 st.markdown(ai_review)
 
-    # Chart Header & Metric Selector Dropdown
     col_hdr, col_drop = st.columns([2, 1])
     col_hdr.markdown("### Performance Trajectory & Multi-Benchmark Attribution")
     col_drop.selectbox(
@@ -263,7 +260,6 @@ try:
         label_visibility="collapsed"
     )
     
-    # Professional Plotly Chart Generation with Multi-Benchmark Overlays
     fig = go.Figure()
     metric_mode = S["chart_metric"]
 
@@ -273,7 +269,6 @@ try:
             fig.add_scatter(x=principal.index, y=principal, name="Total Cash Invested", line=dict(width=1.8, dash="dash", color="#e67e22"))
         fig.add_scatter(x=be.index, y=be, name=f"Primary Benchmark ({bench})", line=dict(width=1.8, color="#3498db"))
         
-        # Add secondary benchmark overlays
         colors = ["#9b59b6", "#e74c3c", "#f1c40f", "#1abc9c"]
         for idx, (b_name, b_ser) in enumerate(sec_bench_series.items()):
             col_c = colors[idx % len(colors)]
@@ -293,7 +288,7 @@ try:
         fig.add_scatter(x=roll["bench_vol"].index, y=roll["bench_vol"], name=f"Benchmark Rolling 1Y Volatility ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
         yaxis_format = ".0%"
 
-    else:  # Drawdown (%)
+    else:
         fig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy Drawdown", line=dict(width=1.5, color="#e74c3c"), fill="tozeroy")
         fig.add_scatter(x=be.index, y=drawdown(be), name=f"Benchmark Drawdown ({bench})", line=dict(width=1, color="#3498db", dash="dot"))
         yaxis_format = ".0%"
@@ -309,7 +304,6 @@ try:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Detailed Tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📋 Annual Breakdown", 
         "📊 Asset Return Breakdown", 
