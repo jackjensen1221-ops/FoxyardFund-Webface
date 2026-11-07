@@ -97,7 +97,7 @@ def rolling_metrics(eq, be):
 def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top_n=1,
                  stop_pct=15, trailing=False, after_stop="cash", cost_bps=5, tax_rate=0.0,
                  initial=10000.0, annual_contribution=10000.0, custom_weights=None):
-    """Fully functioning backtesting simulation loop supporting asset selection, stops, taxes, and DCA."""
+    """Fully functioning backtesting simulation loop with properly aligned DCA benchmark tracking."""
     if prices.empty:
         return None
         
@@ -117,12 +117,12 @@ def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top
     if n_days < 5:
         return None
 
-    cash = float(initial)
     total_invested = float(initial)
+    strat_val = float(initial)
+    bench_val = float(initial)
     
-    years = sorted(list(set(dates.year)))
-    val = float(initial)
-    eq_vals = [val]
+    eq_vals = [strat_val]
+    bench_vals = [bench_val]
     prin_vals = [total_invested]
     
     last_year = dates[0].year
@@ -138,11 +138,14 @@ def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top
         dt = dates[i]
         curr_year = dt.year
         
-        # Handle annual DCA contribution & rebalancing
+        b_ret = bench_rets.loc[dt] if dt in bench_rets.index else 0.0
+        if np.isnan(b_ret):
+            b_ret = 0.0
+
         if curr_year != last_year:
-            cash += annual_contribution
             total_invested += annual_contribution
-            val += annual_contribution
+            strat_val += annual_contribution
+            bench_val += annual_contribution
             last_year = curr_year
             
             if not stock_df.empty and len(stock_df.columns) > 0:
@@ -159,30 +162,29 @@ def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top
                 else:
                     active_tickers = stock_df.columns[:top_n].tolist()
 
-        # Calculate portfolio return for the day
         if active_tickers and all(t in stock_rets.columns for t in active_tickers):
-            day_ret = stock_rets.loc[dt, active_tickers].mean()
+            s_ret = stock_rets.loc[dt, active_tickers].mean()
         else:
-            day_ret = bench_rets.loc[dt] if dt in bench_rets.index else 0.0
+            s_ret = b_ret
             
-        if np.isnan(day_ret):
-            day_ret = 0.0
+        if np.isnan(s_ret):
+            s_ret = 0.0
             
-        # Apply execution cost friction on rebalance days
         if curr_year != last_year:
-            day_ret -= (cost_bps / 10000.0)
+            s_ret -= (cost_bps / 10000.0)
 
-        val = val * (1.0 + day_ret)
-        eq_vals.append(val)
+        strat_val = strat_val * (1.0 + s_ret)
+        bench_val = bench_val * (1.0 + b_ret)
+
+        eq_vals.append(strat_val)
+        bench_vals.append(bench_val)
         prin_vals.append(total_invested)
 
     equity_curve = pd.Series(eq_vals, index=dates)
+    bench_scaled = pd.Series(bench_vals, index=dates)
     principal_curve = pd.Series(prin_vals, index=dates)
-    
-    # Scale benchmark to match initial capital and trajectory
-    bench_scaled = bench_series / bench_series.iloc[0] * initial
 
-    # Annual breakdown table
+    years = sorted(list(set(dates.year)))
     yrs_data = []
     for yr in years:
         yr_slice = equity_curve[equity_curve.index.year == yr]
@@ -194,7 +196,6 @@ def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top
             
     yrs_df = pd.DataFrame(yrs_data)
     
-    # Asset breakdown metrics
     asset_metrics_list = []
     for t in stock_df.columns[:10]:
         t_series = stock_df[t].dropna()
