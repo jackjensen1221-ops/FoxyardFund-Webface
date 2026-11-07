@@ -1,4 +1,4 @@
-"""Backtest engine: pure pandas, no Streamlit, supporting principal accumulation tracking."""
+"""Backtest engine: pure pandas, no Streamlit, supporting rolling analytics and metric calculations."""
 import numpy as np
 import pandas as pd
 
@@ -115,7 +115,6 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
             else:
                 port = pd.concat(vals, axis=1).sum(axis=1) * capital
 
-            # Principal accumulation tracking (flat line per year representing out-of-pocket cash put in)
             prin_series = pd.Series(running_principal, index=cur.index)
             principal_segs.append(prin_series)
 
@@ -150,9 +149,11 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
         asset_breakdown = pd.concat(asset_segs).reindex(equity.index).ffill()
         principal_curve = pd.concat(principal_segs).reindex(equity.index).ffill()
         b = prices[bench].reindex(equity.index).ffill()
+        bench_equity = b / b.iloc[0] * initial
+        
         return {
             "equity": equity, 
-            "bench": b / b.iloc[0] * initial, 
+            "bench": bench_equity, 
             "years": pd.DataFrame(rows),
             "asset_breakdown": asset_breakdown,
             "principal": principal_curve
@@ -177,6 +178,25 @@ def metrics(equity):
 
 def drawdown(equity):
     return equity / equity.cummax() - 1
+
+
+def rolling_metrics(equity, bench_equity):
+    """Calculates rolling 1-year (252 trading days) annualized returns and volatility."""
+    strat_ret = equity.pct_change()
+    bench_ret = bench_equity.pct_change()
+    
+    roll_strat_cagr = (1 + strat_ret).rolling(252).apply(np.prod, raw=True) - 1
+    roll_bench_cagr = (1 + bench_ret).rolling(252).apply(np.prod, raw=True) - 1
+    
+    roll_strat_vol = strat_ret.rolling(252).std() * np.sqrt(252)
+    roll_bench_vol = bench_ret.rolling(252).std() * np.sqrt(252)
+    
+    return {
+        "strat_cagr": roll_strat_cagr,
+        "bench_cagr": roll_bench_cagr,
+        "strat_vol": roll_strat_vol,
+        "bench_vol": roll_bench_vol
+    }
 
 
 def start_year_sensitivity(prices, bench, first=2005, **kw):
