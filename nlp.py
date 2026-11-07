@@ -34,11 +34,9 @@ def parse_question(prompt_text, api_key=None):
         "Also include 'explanation' (string describing what was applied) and 'unsupported' (string if anything was ignored)."
     )
 
-    # Updated to use the current Gemini Flash model endpoint
     model = genai.GenerativeModel('gemini-3.8-flash', system_instruction=system_instruction)
     response = model.generate_content(prompt_text)
     
-    # Clean and parse JSON response
     text = response.text.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -63,7 +61,6 @@ def generate_ai_commentary(metrics_dict, strategy_name, api_key=None):
         "drawdown resilience, and behavioral considerations for an investor."
     )
 
-    # Updated to use the current Gemini Flash model endpoint
     model = genai.GenerativeModel('gemini-3.8-flash')
     response = model.generate_content(prompt)
     return response.text.strip()
