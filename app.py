@@ -1,191 +1,285 @@
-"""Backtest engine: pure pandas, no Streamlit, supporting multi-asset tracking and cash holdings."""
-import numpy as np
+import os
 import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-RULES = {
-    "prior_year_winner": "Last year's winners",
-    "prior_year_loser": "Last year's losers (contrarian)",
-    "mom_6m": "6-month momentum",
-    "mom_12_1": "12-month momentum (skip last month)",
-    "custom_basket": "Custom Stock Basket / Mutual Fund",
-    "random": "Random picks (control)",
-}
+import data
+import nlp
+from catalog import BENCHMARKS, UNIVERSES
+from engine import RULES, drawdown, metrics, run_strategy, start_year_sensitivity
 
+st.set_page_config(
+    page_title="Institutional Portfolio Backtest Terminal",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-def _signal(rule, prices, stocks, yr, y, rng):
-    """Score every stock using ONLY data from before the first trading day of year y."""
-    first_day = prices.index[yr == y][0]
-    if rule in ("prior_year_winner", "prior_year_loser"):
-        prev = prices.loc[yr == y - 1, stocks]
-        if prev.empty:
-            return None
-        return prev.iloc[-1] / prev.iloc[0] - 1
-    if rule in ("mom_6m", "mom_12_1"):
-        months, skip = (6, 0) if rule == "mom_6m" else (12, 1)
-        start = first_day - pd.DateOffset(months=months)
-        end = first_day - pd.DateOffset(months=skip)
-        w = prices.loc[(prices.index >= start) & (prices.index < end), stocks]
-        if w.empty or w.index[0] > start + pd.Timedelta(days=10):
-            return None
-        return w.iloc[-1] / w.iloc[0] - 1
-    if rule == "random":
-        return pd.Series(rng.random(len(stocks)), index=stocks)
-    if rule == "custom_basket":
-        return pd.Series(1.0, index=stocks)
-    raise ValueError(f"Unknown rule: {rule}")
-
-
-def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
-                 stop_pct=0.0, trailing=False, after_stop="cash",
-                 cost_bps=0.0, tax_rate=0.0, initial=10_000, 
-                 annual_contribution=0.0, custom_weights=None, seed=0):
-    try:
-        stocks = [c for c in prices.columns if c != bench]
-        yr = prices.index.year
-        rng = np.random.default_rng(seed)
-        cost = cost_bps / 10_000
-        capital, carry = float(initial), 0.0
-        segs, rows, asset_segs = [], [], []
-        last_year = yr[-1]
-
-        for y in range(start_year, last_year + 1):
-            cur = prices[yr == y]
-            if cur.empty:
-                continue
-                
-            weights = pd.Series(dtype=float)
-            if rule == "custom_basket" and custom_weights is not None:
-                valid_weights = {t: w for t, w in custom_weights.items() if t in cur.columns or t.upper() == "CASH"}
-                if not valid_weights:
-                    picks = []
-                    weights = pd.Series(dtype=float)
-                else:
-                    total_w = sum(valid_weights.values())
-                    if total_w > 0:
-                        weights = pd.Series({t: w / total_w for t, w in valid_weights.items()})
-                    else:
-                        weights = pd.Series(1.0 / len(valid_weights), index=list(valid_weights.keys()))
-                    picks = [t for t in weights.index if t.upper() != "CASH"]
-            else:
-                sig = _signal(rule, prices, stocks, yr, y, rng)
-                if sig is None or sig.empty:
-                    continue
-                sig = sig.sort_values(ascending=(rule == "prior_year_loser"))
-                picks = list(sig.index[:top_n])
-                weights = pd.Series(1.0 / len(picks), index=picks)
-
-            bench_path = cur[bench] / cur[bench].iloc[0]
-            vals, stopped = [], []
-            individual_paths = {}
-            
-            # Handle pure cash allocation if no stocks picked or 100% cash weight
-            cash_weight = weights.get("CASH", 0.0) if "CASH" in weights else 0.0
-            stock_weight_mult = 1.0 - cash_weight
-
-            for t in picks:
-                if t not in cur.columns:
-                    continue
-                raw = (cur[t] / cur[t].iloc[0]).ffill()
-                path = raw * (1 - cost)
-                if stop_pct > 0:
-                    ref = raw.cummax() if trailing else 1.0
-                    hit = raw <= ref * (1 - stop_pct / 100)
-                    if hit.any():
-                        d = hit.idxmax()
-                        val = path[d] * (1 - cost)
-                        path = path.copy()
-                        if after_stop == "benchmark":
-                            path.loc[d:] = val * (1 - cost) * (bench_path.loc[d:] / bench_path[d])
-                        else:
-                            path.loc[d:] = val
-                        stopped.append(f"{t} ({d:%b %d})")
-                w_val = weights.get(t, 1.0 / len(picks) if len(picks) > 0 else 0.0) * stock_weight_mult
-                weighted_path = path * w_val
-                vals.append(weighted_path)
-                individual_paths[t] = weighted_path * capital
-
-            # Add Cash component if applicable
-            if cash_weight > 0:
-                cash_path = pd.Series(1.0, index=cur.index) * cash_weight
-                vals.append(cash_path)
-                individual_paths["CASH"] = cash_path * capital
-
-            if not vals:
-                # 100% cash fallback if everything else fails
-                port = pd.Series(1.0, index=cur.index) * capital
-                individual_paths["CASH"] = port
-            else:
-                port = pd.concat(vals, axis=1).sum(axis=1) * capital
-
-            tax_paid = 0.0
-            if y < last_year:
-                end_val = port.iloc[-1] * (1 - cost)
-                taxable = (end_val - capital) + carry
-                if taxable > 0:
-                    tax_paid, carry = tax_rate * taxable, 0.0
-                else:
-                    carry = taxable
-                port.iloc[-1] = (end_val - tax_paid) + annual_contribution
-
-            segs.append(port)
-            asset_segs.append(pd.DataFrame(individual_paths))
-            
-            rows.append({
-                "Year": y,
-                "Bought": ", ".join(picks) + (f" + {cash_weight*100:.0f}% Cash" if cash_weight > 0 else ""),
-                "Signal": float(sig.iloc[:len(picks)].mean()) if rule != "custom_basket" and len(picks) > 0 else 0.0,
-                "Stopped out": ", ".join(stopped) if stopped else "-",
-                "Tax paid": tax_paid,
-                "Strategy": port.iloc[-1] / (capital + (annual_contribution if y > start_year else 0)) - 1,
-                "Benchmark": bench_path.iloc[-1] - 1,
-            })
-            capital = port.iloc[-1]
-
-        if not segs:
-            return None
-        equity = pd.concat(segs)
-        asset_breakdown = pd.concat(asset_segs).reindex(equity.index).ffill()
-        b = prices[bench].reindex(equity.index).ffill()
-        return {
-            "equity": equity, 
-            "bench": b / b.iloc[0] * initial, 
-            "years": pd.DataFrame(rows),
-            "asset_breakdown": asset_breakdown
-        }
-    except Exception as e:
-        print(f"Strategy execution error: {e}")
-        return None
-
-
-def metrics(equity):
-    r = equity.pct_change().dropna()
-    yrs = max((equity.index[-1] - equity.index[0]).days / 365.25, 1e-9)
-    vol = r.std() * np.sqrt(252)
-    return {
-        "Final value": equity.iloc[-1],
-        "CAGR": (equity.iloc[-1] / equity.iloc[0]) ** (1 / yrs) - 1,
-        "Volatility": vol,
-        "Sharpe (rf=0)": (r.mean() * 252) / vol if vol > 0 else np.nan,
-        "Max drawdown": drawdown(equity).min(),
+# Professional Fintech CSS & Guaranteed Sidebar Styling
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; }
+    section[data-testid="stSidebar"] {
+        display: block !important;
+        visibility: visible !important;
+        background-color: #11161d !important;
+        border-right: 1px solid #30363d !important;
     }
+    button[kind="header"] {
+        background-color: #1f242c !important;
+        color: #ffffff !important;
+        border: 1px solid #30363d !important;
+    }
+    .stMetric {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        padding: 15px;
+        border-radius: 8px;
+    }
+    .card {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+MIN_START = 2005
+PICK_RULES = [k for k in RULES if k != "random"]
+DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MSFT, TSLA, AMZN",
+                bench_key="sp500", custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
+                top_n=1, initial=10_000, annual_contrib=0.0, stop_pct=15, trailing=False, after_stop="cash",
+                cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_individual_assets=True)
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+S = st.session_state
 
 
-def drawdown(equity):
-    return equity / equity.cummax() - 1
+def pct(x):
+    return f"{x:.1%}"
 
 
-def start_year_sensitivity(prices, bench, first=2005, **kw):
-    rows = []
-    for sy in range(first, prices.index[-1].year - 1):
-        r = run_strategy(prices, bench, sy, **kw)
-        if r is None:
-            continue
-        ms, mb = metrics(r["equity"]), metrics(r["bench"])
-        rows.append({
-            "Start year": sy,
-            "Strategy CAGR": ms["CAGR"], "Benchmark CAGR": mb["CAGR"],
-            "Excess": ms["CAGR"] - mb["CAGR"],
-            "Strategy final": ms["Final value"], "Benchmark final": mb["Final value"],
-            "Max drawdown": ms["Max drawdown"],
-        })
-    return pd.DataFrame(rows)
+def get_api_key():
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def apply_nl():
+    text = S.get("nl_text", "").strip()
+    if not text:
+        return
+    if S.get("nl_calls", 0) >= 10:
+        S["nl_msg"] = ("error", "Scenario limit reached for this session.", "")
+        return
+    S["nl_calls"] = S.get("nl_calls", 0) + 1
+    try:
+        out = nlp.parse_question(text, get_api_key())
+        for k, v in out["widgets"].items():
+            S[k] = v
+        S["nl_msg"] = ("ok", out["explanation"], out["unsupported"])
+    except Exception as e:
+        S["nl_msg"] = ("error", f"Couldn't read that prompt: {e}", "")
+
+
+# ---------------- Sidebar Controls ----------------
+sb = st.sidebar
+sb.title("⚙️ Terminal Config")
+sb.markdown("---")
+
+sb.subheader("1. Universe Selection")
+sb.selectbox("Asset Universe", list(UNIVERSES), format_func=UNIVERSES.get, key="universe")
+if S["universe"] == "custom":
+    sb.text_area("Custom Tickers (comma-separated)", key="custom_tickers")
+elif S["universe"] == "nyse":
+    sb.select_slider("Most-traded NYSE stocks", [100, 250, 500, 1000], key="nyse_n")
+
+sb.subheader("2. Benchmark")
+sb.selectbox("Primary Benchmark", list(BENCHMARKS), format_func=lambda k: BENCHMARKS[k]["label"], key="bench_key")
+if S["bench_key"] == "custom":
+    sb.text_input("Custom Benchmark Ticker", key="custom_bench")
+
+sb.subheader("3. Strategy & Allocation")
+sb.selectbox("Selection Rule", PICK_RULES, format_func=RULES.get, key="rule")
+
+custom_weights = None
+if S["rule"] == "custom_basket":
+    sb.markdown("#### Custom Fund / Cash Weights")
+    basket_input = sb.text_input("Tickers & Cash (comma-separated)", key="basket_tickers")
+    b_list = [t.strip().upper() for t in basket_input.split(",") if t.strip()]
+    custom_weights = {}
+    for t in b_list:
+        custom_weights[t] = sb.slider(f"Weight: {t}", 0.0, 1.0, 1.0 / len(b_list) if b_list else 1.0, 0.05)
+
+if S["rule"] != "custom_basket":
+    sb.slider("Top N Positions", 1, 10, key="top_n")
+
+sb.slider("Backtest Start Year", MIN_START, 2025, key="start_year")
+sb.number_input("Initial Capital ($)", 100, 10_000_000, step=1000, key="initial")
+sb.number_input("Annual DCA Contribution ($)", 0, 100_000, step=500, key="annual_contrib")
+
+sb.subheader("4. Chart Display Options")
+sb.checkbox("Show Individual Asset Curves", key="show_individual_assets")
+
+sb.subheader("5. Risk Controls")
+sb.slider("Stop-Loss (%)", 0, 50, key="stop_pct")
+sb.checkbox("Trailing Stop-Loss", key="trailing")
+sb.radio("Post-Stop Allocation", ["cash", "benchmark"], key="after_stop",
+         format_func=lambda x: "Hold Cash" if x == "cash" else "Switch to Benchmark")
+
+sb.subheader("6. Frictions")
+sb.slider("Execution Cost (bps)", 0, 50, key="cost_bps")
+sb.slider("Capital Gains Tax Rate (%)", 0, 50, key="tax_pct")
+
+# ---------------- Main Dashboard Layout ----------------
+st.title("📊 Quantitative Portfolio Backtest Terminal")
+st.markdown("Institutional-grade multi-asset strategy simulation and benchmark comparison engine.")
+
+has_key = bool(get_api_key())
+col_in, col_btn = st.columns([6, 1], vertical_alignment="bottom")
+col_in.text_input(
+    "AI Strategy Prompt", 
+    key="nl_text", 
+    disabled=not has_key, 
+    label_visibility="collapsed",
+    placeholder="e.g., Buy a custom basket of AAPL, MSFT, and 30% CASH"
+)
+col_btn.button("Run Prompt", on_click=apply_nl, type="primary", disabled=not has_key)
+
+if not has_key:
+    st.caption("💡 *To enable AI prompts, add your `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml`.*")
+
+msg = S.get("nl_msg")
+if msg:
+    kind, text, extra = msg
+    if kind == "ok":
+        st.success(f"🤖 **AI Scenario Applied:** {text}")
+    else:
+        st.error(text)
+    if extra:
+        st.caption(f"Note: {extra}")
+
+st.markdown("---")
+
+try:
+    if S["universe"] == "nyse":
+        with st.spinner("Compiling liquid NYSE universe data…"):
+            universe_list = data.get_universe("nyse", "", S["nyse_n"])
+    else:
+        universe_list = data.get_universe(S["universe"], S["custom_tickers"], S["nyse_n"])
+
+    if S["rule"] == "custom_basket" and custom_weights:
+        stock_basket_keys = [t for t in custom_weights.keys() if t.upper() != "CASH"]
+        universe_list = list(set(universe_list + stock_basket_keys))
+
+    if not universe_list and not (custom_weights and len(custom_weights) > 0):
+        st.error("Invalid stock universe configuration.")
+        st.stop()
+
+    stock_prices = data.load_many(universe_list, "Fetching historical market data") if universe_list else pd.DataFrame()
+    
+    bench, bench_series = data.build_benchmark(S["bench_key"], S["custom_bench"], stock_prices if not stock_prices.empty else None)
+    if bench_series is None or bench_series.dropna().empty:
+        st.error(f"Invalid benchmark configuration for {bench}.")
+        st.stop()
+
+    if not stock_prices.empty:
+        prices = stock_prices.drop(columns=[bench], errors="ignore")
+    else:
+        prices = pd.DataFrame(index=bench_series.index)
+        
+    prices[bench] = bench_series.reindex(prices.index).ffill()
+
+    fv = prices[bench].first_valid_index()
+    min_ok = max(MIN_START, fv.year + (0 if fv.dayofyear <= 10 else 1))
+    start_year = max(S["start_year"], min_ok)
+
+    params = dict(rule=S["rule"], top_n=S["top_n"], stop_pct=S["stop_pct"], trailing=S["trailing"],
+                  after_stop=S["after_stop"], cost_bps=S["cost_bps"], tax_rate=S["tax_pct"] / 100,
+                  initial=S["initial"], annual_contribution=S["annual_contrib"], custom_weights=custom_weights)
+    initial = S["initial"]
+
+    res = run_strategy(prices, bench, start_year, **params)
+    if res is None:
+        st.error("Insufficient historical data for selected start year.")
+        st.stop()
+        
+    eq, be, yrs, asset_bd = res["equity"], res["bench"], res["years"], res["asset_breakdown"]
+    ms, mb = metrics(eq), metrics(be)
+
+    # Top Executive Summary Metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Final Portfolio Value", f"${ms['Final value']:,.2f}", f"{ms['CAGR']*100:+.2f}% CAGR")
+    m2.metric("Benchmark Value", f"${mb['Final value']:,.2f}", f"{mb['CAGR']*100:+.2f}% CAGR")
+    m3.metric("Max Drawdown", pct(ms["Max drawdown"]), f"Benchmark: {pct(mb['Max drawdown'])}")
+    
+    bench_sharpe_val = mb.get('Sharpe (rf=0)', 0.0)
+    bench_sharpe_text = f"Benchmark: {bench_sharpe_val:.2f}" if 'Sharpe (rf=0)' in mb else ""
+    strat_sharpe_val = ms.get('Sharpe (rf=0)', 0.0)
+    m4.metric("Sharpe Ratio", f"{strat_sharpe_val:.2f}", bench_sharpe_text)
+
+    st.markdown("### Performance Trajectory & Asset Breakdown")
+    
+    # Professional Plotly Styling with Multi-Asset Traces
+    fig = go.Figure()
+    
+    # Main Aggregate Strategy
+    fig.add_scatter(x=eq.index, y=eq, name="Total Portfolio", line=dict(width=3, color="#2ecc71"))
+    
+    # Individual Asset Traces if enabled
+    if S["show_individual_assets"] and not asset_bd.empty:
+        palette = ["#e67e22", "#9b59b6", "#1abc9c", "#e74c3c", "#f1c40f", "#3498db"]
+        for idx, col in enumerate(asset_bd.columns):
+            color = "#bdc3c7" if col.upper() == "CASH" else palette[idx % len(palette)]
+            fig.add_scatter(
+                x=asset_bd.index, 
+                y=asset_bd[col], 
+                name=f"Asset: {col}", 
+                line=dict(width=1.2, dash="dash", color=color),
+                opacity=0.85
+            )
+
+    # Benchmark Trace
+    fig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
+    
+    # Market Crash Annotations
+    crashes = {"2008-09-15": "2008 GFC", "2020-03-16": "COVID Crash", "2022-01-03": "2022 Tightening"}
+    for date_str, label in crashes.items():
+        dt = pd.to_datetime(date_str)
+        if eq.index.min() <= dt <= eq.index.max():
+            fig.add_vline(x=dt, line_dash="dash", line_color="rgba(255,255,255,0.3)")
+            fig.add_annotation(x=dt, y=eq.max(), text=label, showarrow=False, font=dict(color="gray", size=10))
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=480,
+        margin=dict(l=20, r=20, t=20, b=20),
+        hovermode="x unified",
+        yaxis_tickprefix="$",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Detailed Tabs
+    tab1, tab2, tab3 = st.tabs(["📋 Annual Breakdown", "📉 Risk Analytics", "ℹ️ Methodology"])
+    
+    with tab1:
+        st.dataframe(yrs.style.format({"Year": "{:d}", "Strategy": "{:+.1%}", "Benchmark": "{:+.1%}", "Tax paid": "${:,.0f}"}), use_container_width=True)
+        
+    with tab2:
+        dfig = go.Figure()
+        dfig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy Drawdown", line=dict(color="#e74c3c", width=1.2), fill="tozeroy")
+        dfig.update_layout(template="plotly_dark", height=300, yaxis_tickformat=".0%", margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(dfig, use_container_width=True)
+
+    with tab3:
+        st.markdown("""
+        * **Multi-Asset Allocation:** Supports custom asset baskets combined with cash reserves (`CASH`).
+        * **Rebalancing:** Executed annually on the first trading day of January.
+        * **Frictions:** Modeled with basis point transaction fees and deferred capital gains tax drag.
+        """)
+
+except Exception as e:
+    st.error(f"Runtime Exception: {e}")
