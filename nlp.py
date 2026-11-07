@@ -1,97 +1,67 @@
-"""Turn a plain-English 'what if' question into backtest settings using Claude."""
-import re
-
-from catalog import BENCHMARKS
-
-MODEL = "claude-haiku-5-5"   # cheap and fast; swap for "claude-sonnet-5-5" if you want more nuance
-
-RULES = ["prior_year_winner", "prior_year_loser", "mom_6m", "mom_12_1"]
-
-SYSTEM = """You configure a stock backtesting tool. Convert the user's question into settings by calling set_backtest.
-What the tool can do: once a year (first trading day of January) buy the top N stocks chosen by a rule, equal weight.
-Rules: prior_year_winner (best last calendar year), prior_year_loser (worst last year), mom_6m, mom_12_1.
-Universes: large_cap (30 big stocks), sp500, nyse (most-traded NYSE stocks), custom (user named tickers).
-Benchmarks: sp500, nasdaq100, small_caps, dow, total_market, sixty_forty, bonds, gold, equal_weight, hedge_fund (QAI), long_short, managed_futures, market_neutral, merger_arb, berkshire. If the user names another ticker, use benchmark_ticker instead.
-Optional stop-loss as a PERCENT drop from entry (or from the peak if trailing), checked on daily closes; after a sell the money sits in cash or moves to the benchmark until next January. Optional trading costs and a tax rate on realized gains.
-Only set fields the user actually mentioned or clearly implied; omit everything else.
-If the user gives a stop-loss as a dollar amount or says 'X' without a number, do not invent one: omit stop_pct and say so in 'unsupported'.
-Anything the tool cannot do (intraday data, shorting, leverage, options, rebalancing more often than yearly, non-stock assets) goes in 'unsupported', in one short sentence.
-'explanation' restates in 1-2 plain sentences exactly what will be simulated."""
-
-TOOL = {
-    "name": "set_backtest",
-    "description": "Set the backtest parameters.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "explanation": {"type": "string"},
-            "unsupported": {"type": "string", "description": "Empty if everything is supported."},
-            "rule": {"type": "string", "enum": RULES},
-            "top_n": {"type": "integer", "description": "How many stocks to buy (1-10)."},
-            "stop_pct": {"type": "number", "description": "Stop-loss percent (0-50). 0 means none."},
-            "trailing": {"type": "boolean"},
-            "after_stop": {"type": "string", "enum": ["cash", "benchmark"]},
-            "start_year": {"type": "integer", "description": "First year to buy (2005-2025)."},
-            "cost_bps": {"type": "number", "description": "Cost per trade in basis points."},
-            "tax_pct": {"type": "number", "description": "Tax rate on realized gains, percent."},
-            "universe": {"type": "string", "enum": ["large_cap", "sp500", "nyse", "custom"]},
-            "tickers": {"type": "array", "items": {"type": "string"}, "description": "Only if user named specific stocks."},
-            "benchmark": {"type": "string", "enum": [k for k in BENCHMARKS if k != "custom"]},
-            "benchmark_ticker": {"type": "string", "description": "Only for a benchmark not in the list."},
-        },
-        "required": ["explanation"],
-    },
-}
+"""NLP module powered by the Gemini API for natural language strategy parsing and portfolio commentary."""
+import json
+import os
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 
-def _clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def get_gemini_client(api_key=None):
+    key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not key and hasattr(importlib.import_module("streamlit"), "secrets"):
+        try:
+            import streamlit as st
+            key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
+        except Exception:
+            pass
+    if key and genai:
+        genai.configure(api_key=key)
+        return True
+    return False
 
 
-def clean(raw: dict) -> dict:
-    """Validate and clamp whatever the model returned; never trust it blindly."""
-    w = {}
-    if raw.get("rule") in RULES:
-        w["rule"] = raw["rule"]
-    if isinstance(raw.get("top_n"), (int, float)):
-        w["top_n"] = int(_clamp(round(raw["top_n"]), 1, 10))
-    if isinstance(raw.get("stop_pct"), (int, float)):
-        w["stop_pct"] = int(_clamp(round(raw["stop_pct"]), 0, 50))
-    if isinstance(raw.get("trailing"), bool):
-        w["trailing"] = raw["trailing"]
-    if raw.get("after_stop") in ("cash", "benchmark"):
-        w["after_stop"] = raw["after_stop"]
-    if isinstance(raw.get("start_year"), (int, float)):
-        w["start_year"] = int(_clamp(round(raw["start_year"]), 2005, 2025))
-    if isinstance(raw.get("cost_bps"), (int, float)):
-        w["cost_bps"] = int(_clamp(round(raw["cost_bps"]), 0, 100))
-    if isinstance(raw.get("tax_pct"), (int, float)):
-        w["tax_pct"] = int(_clamp(round(raw["tax_pct"]), 0, 60))
-    if raw.get("universe") in ("large_cap", "sp500", "nyse", "custom"):
-        w["universe"] = raw["universe"]
-    tickers = [t.strip().upper().replace(".", "-") for t in raw.get("tickers", []) if isinstance(t, str)]
-    tickers = [t for t in tickers if re.fullmatch(r"[A-Z0-9\-]{1,10}", t)][:40]
-    if tickers:
-        w["custom_tickers"] = ", ".join(tickers)
-        w["universe"] = "custom"
-    if raw.get("benchmark") in BENCHMARKS and raw["benchmark"] != "custom":
-        w["bench_key"] = raw["benchmark"]
-    else:
-        b = str(raw.get("benchmark_ticker", "")).strip().upper()
-        if re.fullmatch(r"[A-Z0-9\-]{1,10}", b):
-            w["bench_key"], w["custom_bench"] = "custom", b
-    return {"widgets": w,
-            "explanation": str(raw.get("explanation", "")).strip(),
-            "unsupported": str(raw.get("unsupported", "")).strip()}
+def parse_question(prompt_text, api_key=None):
+    """Parses a natural language investment prompt into backtest parameters using Gemini."""
+    if not get_gemini_client(api_key):
+        raise ValueError("Gemini API key not found. Please add GEMINI_API_KEY to your Streamlit secrets.")
 
-
-def parse_question(text: str, api_key: str) -> dict:
-    import anthropic  # imported here so the app still loads if the package is missing
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model=MODEL, max_tokens=700, system=SYSTEM, tools=[TOOL],
-        tool_choice={"type": "tool", "name": "set_backtest"},
-        messages=[{"role": "user", "content": text[:1000]}],
+    system_instruction = (
+        "You are a quantitative backtesting assistant. Parse the user's investment strategy prompt "
+        "and return a JSON object with a 'widgets' dictionary containing matching parameters: "
+        "universe ('large_cap', 'tech', 'nyse', 'custom'), rule ('prior_year_winner', 'prior_year_loser', 'mom_6m', 'mom_12_1', 'custom_basket'), "
+        "top_n (int 1-10), start_year (int 2005-2025), initial (int), annual_contrib (int), stop_pct (int 0-50). "
+        "Also include 'explanation' (string describing what was applied) and 'unsupported' (string if anything was ignored)."
     )
-    block = next(b for b in msg.content if b.type == "tool_use")
-    return clean(block.input)
+
+    model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction)
+    response = model.generate_content(prompt_text)
+    
+    # Clean and parse JSON response
+    text = response.text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.endswith("```"):
+        text = text[:-3]
+        
+    return json.loads(text.strip())
+
+
+def generate_ai_commentary(metrics_dict, strategy_name, api_key=None):
+    """Generates an institutional-grade AI portfolio review using Gemini."""
+    if not get_gemini_client(api_key):
+        return "AI Commentary unavailable (Gemini API key missing)."
+
+    prompt = (
+        f"Analyze this backtested investment strategy '{strategy_name}' with the following metrics:\n"
+        f"- Final Portfolio Value: ${metrics_dict.get('Final value', 0):,.2f}\n"
+        f"- CAGR: {metrics_dict.get('CAGR', 0)*100:.2f}%\n"
+        f"- Sharpe Ratio: {metrics_dict.get('Sharpe (rf=0)', 0):.2f}\n"
+        f"- Max Drawdown: {metrics_dict.get('Max drawdown', 0)*100:.2f}%\n\n"
+        "Provide a concise, highly professional 3-sentence quantitative critique highlighting risk-adjusted performance, "
+        "drawdown resilience, and behavioral considerations for an investor."
+    )
+
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    response = model.generate_content(prompt)
+    return response.text.strip()
