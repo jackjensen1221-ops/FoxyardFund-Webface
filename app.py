@@ -6,7 +6,7 @@ import streamlit as st
 import data
 import nlp
 from catalog import BENCHMARKS, UNIVERSES
-from engine import RULES, drawdown, metrics, run_strategy, start_year_sensitivity
+from engine import RULES, drawdown, metrics, rolling_metrics, run_strategy, start_year_sensitivity
 
 st.set_page_config(
     page_title="Institutional Portfolio Backtest Terminal",
@@ -50,7 +50,8 @@ PICK_RULES = [k for k in RULES if k != "random"]
 DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MSFT, TSLA, AMZN",
                 bench_key="sp500", custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
                 top_n=1, initial=10_000, annual_contrib=10_000, stop_pct=15, trailing=False, after_stop="cash",
-                cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True)
+                cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True,
+                chart_metric="Portfolio Value ($)")
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 S = st.session_state
@@ -208,6 +209,7 @@ try:
         
     eq, be, yrs, asset_bd, principal = res["equity"], res["bench"], res["years"], res["asset_breakdown"], res["principal"]
     ms, mb = metrics(eq), metrics(be)
+    roll = rolling_metrics(eq, be)
 
     # Top Executive Summary Metrics
     m1, m2, m3, m4 = st.columns(4)
@@ -220,41 +222,57 @@ try:
     strat_sharpe_val = ms.get('Sharpe (rf=0)', 0.0)
     m4.metric("Sharpe Ratio", f"{strat_sharpe_val:.2f}", bench_sharpe_text)
 
-    st.markdown("### Performance Trajectory & Principal Baseline")
+    # Chart Header & Metric Selector Dropdown
+    col_hdr, col_drop = st.columns([2, 1])
+    col_hdr.markdown("### Performance Trajectory & Analytics")
+    col_drop.selectbox(
+        "Chart Metric View", 
+        ["Portfolio Value ($)", "Rolling 1Y CAGR (%)", "Rolling 1Y Volatility (%)", "Drawdown (%)"],
+        key="chart_metric",
+        label_visibility="collapsed"
+    )
     
-    # Professional Plotly Styling with Principal Baseline
+    # Professional Plotly Chart Generation based on Dropdown Selection
     fig = go.Figure()
-    
-    # Main Aggregate Strategy
-    fig.add_scatter(x=eq.index, y=eq, name="Strategy Portfolio", line=dict(width=3, color="#2ecc71"))
-    
-    # Total Invested Principal (No Interest) Trace
-    if S["show_principal"] and not principal.empty:
-        fig.add_scatter(
-            x=principal.index, 
-            y=principal, 
-            name="Total Cash Invested (No Interest)", 
-            line=dict(width=1.8, dash="dash", color="#e67e22"),
-            opacity=0.9
-        )
+    metric_mode = S["chart_metric"]
 
-    # Benchmark Trace
-    fig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
-    
+    if metric_mode == "Portfolio Value ($)":
+        fig.add_scatter(x=eq.index, y=eq, name="Strategy Portfolio", line=dict(width=3, color="#2ecc71"))
+        if S["show_principal"] and not principal.empty:
+            fig.add_scatter(x=principal.index, y=principal, name="Total Cash Invested (No Interest)", line=dict(width=1.8, dash="dash", color="#e67e22"))
+        fig.add_scatters = fig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
+        yaxis_format = "$"
+
+    elif metric_mode == "Rolling 1Y CAGR (%)":
+        fig.add_scatter(x=roll["strat_cagr"].index, y=roll["strat_cagr"], name="Strategy Rolling 1Y CAGR", line=dict(width=2, color="#2ecc71"))
+        fig.add_scatter(x=roll["bench_cagr"].index, y=roll["bench_cagr"], name=f"Benchmark Rolling 1Y CAGR ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
+        yaxis_format = ".0%"
+
+    elif metric_mode == "Rolling 1Y Volatility (%)":
+        fig.add_scatter(x=roll["strat_vol"].index, y=roll["strat_vol"], name="Strategy Rolling 1Y Volatility", line=dict(width=2, color="#e74c3c"))
+        fig.add_scatter(x=roll["bench_vol"].index, y=roll["bench_vol"], name=f"Benchmark Rolling 1Y Volatility ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
+        yaxis_format = ".0%"
+
+    else:  # Drawdown (%)
+        fig.add_scatter(x=eq.index, y=drawdown(eq), name="Strategy Drawdown", line=dict(width=1.5, color="#e74c3c"), fill="tozeroy")
+        fig.add_scatter(x=be.index, y=drawdown(be), name=f"Benchmark Drawdown ({bench})", line=dict(width=1, color="#3498db", dash="dot"))
+        yaxis_format = ".0%"
+
     # Market Crash Annotations
     crashes = {"2008-09-15": "2008 GFC", "2020-03-16": "COVID Crash", "2022-01-03": "2022 Tightening"}
     for date_str, label in crashes.items():
         dt = pd.to_datetime(date_str)
         if eq.index.min() <= dt <= eq.index.max():
             fig.add_vline(x=dt, line_dash="dash", line_color="rgba(255,255,255,0.3)")
-            fig.add_annotation(x=dt, y=eq.max(), text=label, showarrow=False, font=dict(color="gray", size=10))
+            fig.add_annotation(x=dt, y=eq.max() if metric_mode == "Portfolio Value ($)" else 0, text=label, showarrow=False, font=dict(color="gray", size=10))
 
     fig.update_layout(
         template="plotly_dark",
         height=480,
         margin=dict(l=20, r=20, t=20, b=20),
         hovermode="x unified",
-        yaxis_tickprefix="$",
+        yaxis_tickprefix="$" if metric_mode == "Portfolio Value ($)" else "",
+        yaxis_tickformat="" if metric_mode == "Portfolio Value ($)" else yaxis_format,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -273,9 +291,9 @@ try:
 
     with tab3:
         st.markdown("""
+        * **Rolling Metrics:** Calculates 1-year (252 trading day) rolling compound returns and annualized volatility.
         * **Principal Tracking:** Shows cumulative out-of-pocket cash contributed (Initial Capital + Annual DCA) without market returns.
-        * **Rebalancing:** Executed annually on the first trading day of January.
-        * **Frictions:** Modeled with basis point transaction fees and deferred capital gains tax drag.
+        * **Rebalancing & Frictions:** Executed annually with transaction fees and tax drag modeled.
         """)
 
 except Exception as e:
