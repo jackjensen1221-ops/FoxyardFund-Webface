@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -14,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Professional Fintech CSS & Guaranteed Sidebar Styling
+# Custom Styling
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
@@ -35,13 +36,6 @@ st.markdown("""
         padding: 15px;
         border-radius: 8px;
     }
-    .card {
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        padding: 20px;
-        border-radius: 10px;
-        margin-bottom: 20px;
-    }
     .psych-card {
         background-color: #1f1a1d;
         border-left: 4px solid #e74c3c;
@@ -57,8 +51,9 @@ PICK_RULES = [k for k in RULES if k != "random"]
 DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MSFT, TSLA, AMZN",
                 bench_key="sp500", secondary_benchs=["nasdaq100"], custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
                 top_n=1, initial=10_000, annual_contrib=10_000, stop_pct=15, trailing=False, after_stop="cash",
-                cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True,
-                chart_metric="Portfolio Value ($)", ai_mode=False)
+                cost_bps=5, tax_pct=0, reinvest_dividends=True, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True,
+                chart_metric="Portfolio Value ($)", ai_mode=False, fund_name="Apex Alpha Growth Fund",
+                fund_tickers="AAPL, NVDA, MSFT, AMZN, GOOGL")
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 S = st.session_state
@@ -99,7 +94,6 @@ sb = st.sidebar
 sb.title("⚙️ Terminal Config")
 sb.markdown("---")
 
-# AI Mode Toggle Switch
 sb.subheader("🤖 AI Intelligence")
 sb.toggle("Enable Gemini AI Mode", key="ai_mode", help="Turn on for natural language prompts and AI portfolio reviews.")
 
@@ -145,13 +139,14 @@ sb.checkbox("Trailing Stop-Loss", key="trailing")
 sb.radio("Post-Stop Allocation", ["cash", "benchmark"], key="after_stop",
          format_func=lambda x: "Hold Cash" if x == "cash" else "Switch to Benchmark")
 
-sb.subheader("6. Frictions")
+sb.subheader("6. Frictions & Dividends")
 sb.slider("Execution Cost (bps)", 0, 50, key="cost_bps")
 sb.slider("Capital Gains Tax Rate (%)", 0, 50, key="tax_pct")
+sb.checkbox("Reinvest Dividends (DRIP)", key="reinvest_dividends", help="Automatically reinvest dividend payouts back into stock holdings to compound returns.")
 
 # ---------------- Main Dashboard Layout ----------------
 st.title("📊 Institutional Quantitative Backtest Terminal")
-st.markdown("Advanced multi-asset strategy simulator with multi-benchmark attribution, Gemini AI intelligence, and behavioral risk modeling.")
+st.markdown("Advanced multi-asset strategy simulator with DRIP dividend compounding, custom fund creation, and multi-benchmark attribution.")
 
 ai_enabled = S.get("ai_mode", False)
 has_key = bool(get_api_key())
@@ -226,7 +221,8 @@ try:
 
     params = dict(rule=S["rule"], top_n=S["top_n"], stop_pct=S["stop_pct"], trailing=S["trailing"],
                   after_stop=S["after_stop"], cost_bps=S["cost_bps"], tax_rate=S["tax_pct"] / 100,
-                  initial=S["initial"], annual_contribution=S["annual_contrib"], custom_weights=custom_weights)
+                  initial=S["initial"], annual_contribution=S["annual_contrib"], custom_weights=custom_weights,
+                  reinvest_dividends=S["reinvest_dividends"])
 
     res = run_strategy(prices, bench, start_year, **params)
     if res is None:
@@ -304,10 +300,11 @@ try:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📋 Annual Breakdown", 
         "📊 Asset Return Breakdown", 
         "📈 Factor Attribution", 
+        "🏗️ Mutual Fund Builder",
         "🧠 Behavioral Risk Coach",
         "ℹ️ Methodology"
     ])
@@ -335,6 +332,55 @@ try:
         st.info("💡 **Interpretation:** A Beta close to 1.0 indicates your strategy moves in lockstep with the benchmark. A high Alpha with a moderate Beta signifies true risk-adjusted excess returns.")
 
     with tab4:
+        st.markdown("### 🏗️ Mutual Fund Sandbox & Custom Portfolio Architect")
+        st.markdown("Tinker with individual equity weightings to design, name, and stress-test your custom fund against broad market benchmarks.")
+        
+        c_meta1, c_meta2 = st.columns([2, 3])
+        c_meta1.text_input("Mutual Fund Name", key="fund_name")
+        c_meta2.text_input("Constituent Tickers (comma-separated)", key="fund_tickers")
+        
+        fund_ticker_list = [t.strip().upper() for t in S["fund_tickers"].split(",") if t.strip()]
+        
+        if fund_ticker_list:
+            st.markdown("#### Constituent Allocation Weights")
+            col_weights = st.columns(min(len(fund_ticker_list), 5))
+            fund_weights = {}
+            for idx, ticker in enumerate(fund_ticker_list):
+                with col_weights[idx % len(col_weights)]:
+                    fund_weights[ticker] = st.slider(f"{ticker} Weight", 0.0, 1.0, 1.0 / len(fund_ticker_list), 0.05, key=f"w_{ticker}")
+                    
+            fund_prices = data.load_many(fund_ticker_list, "Fetching fund constituent prices")
+            if not fund_prices.empty:
+                fund_res = run_custom_fund(fund_prices, fund_weights, start_year, S["initial"], S["annual_contrib"])
+                if fund_res:
+                    fund_eq = fund_res["equity"]
+                    fund_prin = fund_res["principal"]
+                    norm_w = fund_res["weights"]
+                    fund_ms = metrics(fund_eq)
+                    
+                    st.markdown("---")
+                    fm1, fm2, fm3, fm4 = st.columns(4)
+                    fm1.metric(f"Fund Value ({S['fund_name']})", f"${fund_ms['Final value']:,.2f}", f"{fund_ms['CAGR']*100:+.2f}% CAGR")
+                    fm2.metric("Fund Sharpe Ratio", f"{fund_ms['Sharpe (rf=0)']:.2f}")
+                    fm3.metric("Fund Volatility", pct(fund_ms["Volatility"]))
+                    fm4.metric("Max Drawdown", pct(fund_ms["Max drawdown"]))
+                    
+                    c_chart1, c_chart2 = st.columns([3, 2])
+                    with c_chart1:
+                        ffig = go.Figure()
+                        ffig.add_scatter(x=fund_eq.index, y=fund_eq, name=S["fund_name"], line=dict(width=3, color="#9b59b6"))
+                        ffig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.8, color="#3498db", dash="dot"))
+                        if S["show_principal"]:
+                            ffig.add_scatter(x=fund_prin.index, y=fund_prin, name="Total Invested Principal", line=dict(width=1.5, dash="dash", color="#e67e22"))
+                        ffig.update_layout(template="plotly_dark", height=380, title=f"Historical Growth of {S['fund_name']}", yaxis_tickprefix="$")
+                        st.plotly_chart(ffig, use_container_width=True)
+                        
+                    with c_chart2:
+                        pie_df = pd.DataFrame({"Ticker": list(norm_w.keys()), "Normalized Weight": list(norm_w.values())})
+                        pie_fig = px.pie(pie_df, values="Normalized Weight", names="Ticker", title="Target Portfolio Allocation", hole=0.4, template="plotly_dark")
+                        st.plotly_chart(pie_fig, use_container_width=True)
+
+    with tab5:
         st.markdown("### Behavioral Finance & Emotional Vulnerability Audit")
         max_dd = abs(ms["Max drawdown"])
         vol = ms["Volatility"]
@@ -369,12 +415,13 @@ try:
             </div>
             """, unsafe_allow_html=True)
 
-    with tab5:
+    with tab6:
         st.markdown("""
+        * **Dividend Reinvestment (DRIP):** Toggle whether dividend distributions are automatically reinvested to compound total return or held as cash.
+        * **Mutual Fund Builder:** Architect custom stock baskets, specify custom weighting schemes, name your fund, and track compounding trajectories against benchmark baselines.
         * **Multi-Benchmark Overlays:** Overlay multiple benchmark series (S&P 500, Nasdaq, Russell, Bonds) simultaneously onto the main trajectory chart.
         * **Factor Attribution:** Calculates Alpha, Beta, R², and correlation via daily return linear regression against the primary benchmark.
         * **AI Mode Toggle:** Keeps your Gemini API quota protected by disabling AI calls unless explicitly toggled on.
-        * **Behavioral Audit:** Flags cognitive bias triggers (loss aversion, panic-selling thresholds, and volatility fatigue).
         """)
 
 except Exception as e:
