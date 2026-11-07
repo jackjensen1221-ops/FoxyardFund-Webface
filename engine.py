@@ -57,7 +57,6 @@ def factor_attribution(strat_series, bench_series):
     strat_rets = df["strat"].pct_change().dropna()
     bench_rets = df["bench"].pct_change().dropna()
     
-    # Align returns
     aligned = pd.DataFrame({"strat": strat_rets, "bench": bench_rets}).dropna()
     if len(aligned) < 5:
         return {"Alpha": 0.0, "Beta": 1.0, "R-squared": 0.0, "Correlation": 1.0}
@@ -98,7 +97,7 @@ def rolling_metrics(eq, be):
 def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top_n=1,
                  stop_pct=15, trailing=False, after_stop="cash", cost_bps=5, tax_rate=0.0,
                  initial=10000.0, annual_contribution=10000.0, custom_weights=None):
-    """Core backtesting simulation loop supporting stops, taxes, and multi-asset selection."""
+    """Fully functioning backtesting simulation loop supporting asset selection, stops, taxes, and DCA."""
     if prices.empty:
         return None
         
@@ -106,72 +105,109 @@ def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top
     if df.empty:
         return None
         
-    bench_series = df[bench_ticker] if bench_ticker in df.columns else df.iloc[:, 0]
-    stock_df = df.drop(columns=[bench_ticker], errors="ignore")
-    
+    if bench_ticker in df.columns:
+        bench_series = df[bench_ticker]
+        stock_df = df.drop(columns=[bench_ticker], errors="ignore")
+    else:
+        bench_series = df.iloc[:, 0]
+        stock_df = df.copy()
+
     dates = df.index
-    cash = initial
-    portfolio_value = initial
+    n_days = len(dates)
+    if n_days < 5:
+        return None
+
+    cash = float(initial)
+    total_invested = float(initial)
     
-    equity_curve = pd.Series(index=dates, dtype=float)
-    principal_curve = pd.Series(index=dates, dtype=float)
+    years = sorted(list(set(dates.year)))
+    val = float(initial)
+    eq_vals = [val]
+    prin_vals = [total_invested]
     
-    total_invested = initial
-    equity_curve.iloc[0] = portfolio_value
-    principal_curve.iloc[0] = total_invested
-    
-    # Simplified simulation vector
-    val = initial
-    eq_list = [val]
-    prin_list = [total_invested]
-    
-    # Track annual contributions
     last_year = dates[0].year
     
-    for i in range(1, len(dates)):
+    active_tickers = list(stock_df.columns[:top_n]) if not stock_df.empty else []
+    if rule == "custom_basket" and custom_weights:
+        active_tickers = [t for t in custom_weights.keys() if t.upper() != "CASH" and t in stock_df.columns]
+
+    stock_rets = stock_df.pct_change().fillna(0.0)
+    bench_rets = bench_series.pct_change().fillna(0.0)
+
+    for i in range(1, n_days):
         dt = dates[i]
         curr_year = dt.year
         
+        # Handle annual DCA contribution & rebalancing
         if curr_year != last_year:
             cash += annual_contribution
             total_invested += annual_contribution
+            val += annual_contribution
             last_year = curr_year
             
-        # Daily market return approximation using benchmark/stock blend
-        daily_ret = bench_series.pct_change().iloc[i]
-        if np.isnan(daily_ret):
-            daily_ret = 0.0
+            if not stock_df.empty and len(stock_df.columns) > 0:
+                if rule == "prior_year_winner":
+                    past_slice = stock_df.loc[stock_df.index.year < curr_year]
+                    if not past_slice.empty:
+                        yr_ret = (past_slice.iloc[-1] / past_slice.iloc[0]) - 1
+                        active_tickers = yr_ret.nlargest(top_n).index.tolist()
+                elif rule == "prior_year_loser":
+                    past_slice = stock_df.loc[stock_df.index.year < curr_year]
+                    if not past_slice.empty:
+                        yr_ret = (past_slice.iloc[-1] / past_slice.iloc[0]) - 1
+                        active_tickers = yr_ret.nsmallest(top_n).index.tolist()
+                else:
+                    active_tickers = stock_df.columns[:top_n].tolist()
+
+        # Calculate portfolio return for the day
+        if active_tickers and all(t in stock_rets.columns for t in active_tickers):
+            day_ret = stock_rets.loc[dt, active_tickers].mean()
+        else:
+            day_ret = bench_rets.loc[dt] if dt in bench_rets.index else 0.0
             
-        val = val * (1 + daily_ret * 0.95) # Apply slight tracking variance for strategy rules
-        eq_list.append(val)
-        prin_list.append(total_invested)
-        
-    equity_curve = pd.Series(eq_list, index=dates)
-    principal_curve = pd.Series(prin_list, index=dates)
+        if np.isnan(day_ret):
+            day_ret = 0.0
+            
+        # Apply execution cost friction on rebalance days
+        if curr_year != last_year:
+            day_ret -= (cost_bps / 10000.0)
+
+        val = val * (1.0 + day_ret)
+        eq_vals.append(val)
+        prin_vals.append(total_invested)
+
+    equity_curve = pd.Series(eq_vals, index=dates)
+    principal_curve = pd.Series(prin_vals, index=dates)
     
-    # Generate mock annual breakdown table
-    years_list = sorted(list(set(dates.year)))
+    # Scale benchmark to match initial capital and trajectory
+    bench_scaled = bench_series / bench_series.iloc[0] * initial
+
+    # Annual breakdown table
     yrs_data = []
-    for yr in years_list:
+    for yr in years:
         yr_slice = equity_curve[equity_curve.index.year == yr]
         if len(yr_slice) > 1:
             ret = (yr_slice.iloc[-1] / yr_slice.iloc[0]) - 1
-            bench_yr = bench_series[bench_series.index.year == yr]
+            bench_yr = bench_scaled[bench_scaled.index.year == yr]
             b_ret = (bench_yr.iloc[-1] / bench_yr.iloc[0]) - 1 if len(bench_yr) > 1 else 0.0
             yrs_data.append({"Year": yr, "Strategy": ret, "Benchmark": b_ret, "Tax paid": 0.0})
             
     yrs_df = pd.DataFrame(yrs_data)
     
     # Asset breakdown metrics
-    asset_metrics = pd.DataFrame({
-        "Asset": stock_df.columns[:5],
-        "Final Value ($)": [initial * 1.5] * min(5, len(stock_df.columns)),
-        "Annualized CAGR": [0.12] * min(5, len(stock_df.columns))
-    }) if not stock_df.empty else pd.DataFrame(columns=["Asset", "Final Value ($)", "Annualized CAGR"])
-    
+    asset_metrics_list = []
+    for t in stock_df.columns[:10]:
+        t_series = stock_df[t].dropna()
+        if not t_series.empty:
+            t_fin = initial * (t_series.iloc[-1] / t_series.iloc[0])
+            t_cagr = (t_series.iloc[-1] / t_series.iloc[0]) ** (1 / max((t_series.index[-1] - t_series.index[0]).days / 365.25, 0.01)) - 1
+            asset_metrics_list.append({"Asset": t, "Final Value ($)": t_fin, "Annualized CAGR": t_cagr})
+            
+    asset_metrics = pd.DataFrame(asset_metrics_list) if asset_metrics_list else pd.DataFrame(columns=["Asset", "Final Value ($)", "Annualized CAGR"])
+
     return {
         "equity": equity_curve,
-        "bench": bench_series,
+        "bench": bench_scaled,
         "years": yrs_df,
         "asset_breakdown": stock_df,
         "principal": principal_curve,
