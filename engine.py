@@ -1,4 +1,4 @@
-"""Backtest engine: pure pandas, no Streamlit, supporting rolling analytics and metric calculations."""
+"""Backtest engine: pure pandas, no Streamlit, supporting multi-asset tracking and individual asset CAGRs."""
 import numpy as np
 import pandas as pd
 
@@ -151,12 +151,25 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
         b = prices[bench].reindex(equity.index).ffill()
         bench_equity = b / b.iloc[0] * initial
         
+        # Calculate individual asset annualized CAGRs over the backtest period
+        asset_metrics = []
+        total_yrs = max((equity.index[-1] - equity.index[0]).days / 365.25, 1e-9)
+        for col in asset_breakdown.columns:
+            s_eq = asset_breakdown[col].dropna()
+            if not s_eq.empty and s_eq.iloc[0] > 0:
+                final_v = s_eq.iloc[-1]
+                start_v = s_eq.iloc[0]
+                cagr = (final_v / start_v) ** (1 / total_yrs) - 1
+                asset_metrics.append({"Asset": col, "Final Value ($)": final_v, "Annualized CAGR": cagr})
+        asset_df = pd.DataFrame(asset_metrics)
+
         return {
             "equity": equity, 
             "bench": bench_equity, 
             "years": pd.DataFrame(rows),
             "asset_breakdown": asset_breakdown,
-            "principal": principal_curve
+            "principal": principal_curve,
+            "asset_metrics": asset_df
         }
     except Exception as e:
         print(f"Strategy execution error: {e}")
@@ -181,7 +194,6 @@ def drawdown(equity):
 
 
 def rolling_metrics(equity, bench_equity):
-    """Calculates rolling 1-year (252 trading days) annualized returns and volatility."""
     strat_ret = equity.pct_change()
     bench_ret = bench_equity.pct_change()
     
