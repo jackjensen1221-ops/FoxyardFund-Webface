@@ -1,4 +1,4 @@
-"""Backtest engine: pure pandas, no Streamlit, so it is easy to test and reuse."""
+"""Backtest engine: pure pandas, no Streamlit, supporting multi-asset tracking and cash holdings."""
 import numpy as np
 import pandas as pd
 
@@ -45,7 +45,7 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
         rng = np.random.default_rng(seed)
         cost = cost_bps / 10_000
         capital, carry = float(initial), 0.0
-        segs, rows = [], []
+        segs, rows, asset_segs = [], [], []
         last_year = yr[-1]
 
         for y in range(start_year, last_year + 1):
@@ -53,12 +53,19 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
             if cur.empty:
                 continue
                 
-            if rule == "custom_basket" and custom_weights:
-                picks = [t for t in custom_weights.keys() if t in cur.columns]
-                if not picks:
-                    continue
-                weights = pd.Series({t: custom_weights[t] for t in picks})
-                weights = weights / weights.sum() if weights.sum() > 0 else pd.Series(1.0 / len(picks), index=picks)
+            weights = pd.Series(dtype=float)
+            if rule == "custom_basket" and custom_weights is not None:
+                valid_weights = {t: w for t, w in custom_weights.items() if t in cur.columns or t.upper() == "CASH"}
+                if not valid_weights:
+                    picks = []
+                    weights = pd.Series(dtype=float)
+                else:
+                    total_w = sum(valid_weights.values())
+                    if total_w > 0:
+                        weights = pd.Series({t: w / total_w for t, w in valid_weights.items()})
+                    else:
+                        weights = pd.Series(1.0 / len(valid_weights), index=list(valid_weights.keys()))
+                    picks = [t for t in weights.index if t.upper() != "CASH"]
             else:
                 sig = _signal(rule, prices, stocks, yr, y, rng)
                 if sig is None or sig.empty:
@@ -69,7 +76,12 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
 
             bench_path = cur[bench] / cur[bench].iloc[0]
             vals, stopped = [], []
+            individual_paths = {}
             
+            # Handle pure cash allocation if no stocks picked or 100% cash weight
+            cash_weight = weights.get("CASH", 0.0) if "CASH" in weights else 0.0
+            stock_weight_mult = 1.0 - cash_weight
+
             for t in picks:
                 if t not in cur.columns:
                     continue
@@ -87,14 +99,25 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
                         else:
                             path.loc[d:] = val
                         stopped.append(f"{t} ({d:%b %d})")
-                vals.append(path * weights[t])
+                w_val = weights.get(t, 1.0 / len(picks) if len(picks) > 0 else 0.0) * stock_weight_mult
+                weighted_path = path * w_val
+                vals.append(weighted_path)
+                individual_paths[t] = weighted_path * capital
+
+            # Add Cash component if applicable
+            if cash_weight > 0:
+                cash_path = pd.Series(1.0, index=cur.index) * cash_weight
+                vals.append(cash_path)
+                individual_paths["CASH"] = cash_path * capital
 
             if not vals:
-                continue
+                # 100% cash fallback if everything else fails
+                port = pd.Series(1.0, index=cur.index) * capital
+                individual_paths["CASH"] = port
+            else:
+                port = pd.concat(vals, axis=1).sum(axis=1) * capital
 
-            port = pd.concat(vals, axis=1).sum(axis=1) * capital
             tax_paid = 0.0
-            
             if y < last_year:
                 end_val = port.iloc[-1] * (1 - cost)
                 taxable = (end_val - capital) + carry
@@ -105,10 +128,12 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
                 port.iloc[-1] = (end_val - tax_paid) + annual_contribution
 
             segs.append(port)
+            asset_segs.append(pd.DataFrame(individual_paths))
+            
             rows.append({
                 "Year": y,
-                "Bought": ", ".join(picks),
-                "Signal": float(sig.iloc[:len(picks)].mean()) if rule != "custom_basket" else 0.0,
+                "Bought": ", ".join(picks) + (f" + {cash_weight*100:.0f}% Cash" if cash_weight > 0 else ""),
+                "Signal": float(sig.iloc[:len(picks)].mean()) if rule != "custom_basket" and len(picks) > 0 else 0.0,
                 "Stopped out": ", ".join(stopped) if stopped else "-",
                 "Tax paid": tax_paid,
                 "Strategy": port.iloc[-1] / (capital + (annual_contribution if y > start_year else 0)) - 1,
@@ -119,8 +144,14 @@ def run_strategy(prices, bench, start_year, rule="prior_year_winner", top_n=1,
         if not segs:
             return None
         equity = pd.concat(segs)
+        asset_breakdown = pd.concat(asset_segs).reindex(equity.index).ffill()
         b = prices[bench].reindex(equity.index).ffill()
-        return {"equity": equity, "bench": b / b.iloc[0] * initial, "years": pd.DataFrame(rows)}
+        return {
+            "equity": equity, 
+            "bench": b / b.iloc[0] * initial, 
+            "years": pd.DataFrame(rows),
+            "asset_breakdown": asset_breakdown
+        }
     except Exception as e:
         print(f"Strategy execution error: {e}")
         return None
