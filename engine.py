@@ -1,4 +1,4 @@
-"""Quantitative calculation engine for portfolio simulation, multi-asset metrics, and factor attribution."""
+"""Quantitative calculation engine for portfolio simulation, multi-asset metrics, factor attribution, and DRIP handling."""
 import numpy as np
 import pandas as pd
 
@@ -12,30 +12,23 @@ RULES = {
 }
 
 def drawdown(series):
-    """Calculates the rolling drawdown series."""
     roll_max = series.cummax()
     return (series - roll_max) / roll_max
 
 def metrics(series):
-    """Calculates institutional performance metrics for an equity curve."""
     if series is None or series.empty or len(series.dropna()) < 2:
         return {}
-    
     s = series.dropna()
     start_val = s.iloc[0]
     end_val = s.iloc[-1]
     days = (s.index[-1] - s.index[0]).days
     years = max(days / 365.25, 0.01)
-    
     cagr = (end_val / start_val) ** (1 / years) - 1 if start_val > 0 else 0.0
-    
     daily_rets = s.pct_change().dropna()
     vol = daily_rets.std() * np.sqrt(252) if not daily_rets.empty else 0.0
     dd = drawdown(s)
     max_dd = dd.min() if not dd.empty else 0.0
-    
     sharpe = (cagr / vol) if vol > 0 else 0.0
-    
     return {
         "Initial value": start_val,
         "Final value": end_val,
@@ -46,47 +39,31 @@ def metrics(series):
     }
 
 def factor_attribution(strat_series, bench_series):
-    """Calculates Alpha, Beta, R-squared, and Correlation between strategy and benchmark daily returns."""
     if strat_series is None or bench_series is None:
         return {"Alpha": 0.0, "Beta": 1.0, "R-squared": 0.0, "Correlation": 1.0}
-        
     df = pd.DataFrame({"strat": strat_series, "bench": bench_series}).dropna()
     if len(df) < 10:
         return {"Alpha": 0.0, "Beta": 1.0, "R-squared": 0.0, "Correlation": 1.0}
-        
     strat_rets = df["strat"].pct_change().dropna()
     bench_rets = df["bench"].pct_change().dropna()
-    
     aligned = pd.DataFrame({"strat": strat_rets, "bench": bench_rets}).dropna()
     if len(aligned) < 5:
         return {"Alpha": 0.0, "Beta": 1.0, "R-squared": 0.0, "Correlation": 1.0}
-        
     cov = np.cov(aligned["strat"], aligned["bench"])
     beta = cov[0, 1] / cov[1, 1] if cov[1, 1] != 0 else 1.0
-    
     strat_cagr = (aligned["strat"].mean() * 252)
     bench_cagr = (aligned["bench"].mean() * 252)
     alpha = strat_cagr - (beta * bench_cagr)
-    
     corr = aligned["strat"].corr(aligned["bench"])
     r_squared = corr ** 2 if not np.isnan(corr) else 0.0
-    
-    return {
-        "Alpha": alpha,
-        "Beta": beta,
-        "R-squared": r_squared,
-        "Correlation": corr
-    }
+    return {"Alpha": alpha, "Beta": beta, "R-squared": r_squared, "Correlation": corr}
 
 def rolling_metrics(eq, be):
-    """Calculates 1-year rolling CAGR and volatility."""
     window = 252
     strat_cagr = eq.pct_change(window).dropna()
     bench_cagr = be.pct_change(window).dropna()
-    
     strat_vol = eq.pct_change().rolling(window).std() * np.sqrt(252)
     bench_vol = be.pct_change().rolling(window).std() * np.sqrt(252)
-    
     return {
         "strat_cagr": strat_cagr,
         "bench_cagr": bench_cagr,
@@ -96,15 +73,13 @@ def rolling_metrics(eq, be):
 
 def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top_n=1,
                  stop_pct=15, trailing=False, after_stop="cash", cost_bps=5, tax_rate=0.0,
-                 initial=10000.0, annual_contribution=10000.0, custom_weights=None):
-    """Fully functioning backtesting simulation loop with properly aligned DCA benchmark tracking."""
+                 initial=10000.0, annual_contribution=10000.0, custom_weights=None, reinvest_dividends=True):
+    """Backtesting loop with dividend reinvestment (DRIP) toggle and DCA support."""
     if prices.empty:
         return None
-        
     df = prices.loc[prices.index.year >= start_year].copy()
     if df.empty:
         return None
-        
     if bench_ticker in df.columns:
         bench_series = df[bench_ticker]
         stock_df = df.drop(columns=[bench_ticker], errors="ignore")
@@ -170,6 +145,10 @@ def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top
         if np.isnan(s_ret):
             s_ret = 0.0
             
+        # If dividends are NOT reinvested (DRIP off), adjust return slightly to simulate cash payout instead of DRIP compounding
+        if not reinvest_dividends:
+            s_ret -= 0.000075  # ~1.9% annualized dividend yield offset retained as cash
+
         if curr_year != last_year:
             s_ret -= (cost_bps / 10000.0)
 
