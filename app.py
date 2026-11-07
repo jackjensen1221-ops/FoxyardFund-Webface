@@ -49,8 +49,8 @@ MIN_START = 2005
 PICK_RULES = [k for k in RULES if k != "random"]
 DEFAULTS = dict(universe="large_cap", nyse_n=250, custom_tickers="AAPL, NVDA, MSFT, TSLA, AMZN",
                 bench_key="sp500", custom_bench="QQQ", start_year=2012, rule="prior_year_winner",
-                top_n=1, initial=10_000, annual_contrib=0.0, stop_pct=15, trailing=False, after_stop="cash",
-                cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_individual_assets=True)
+                top_n=1, initial=10_000, annual_contrib=10_000, stop_pct=15, trailing=False, after_stop="cash",
+                cost_bps=5, tax_pct=0, nl_text="", basket_tickers="AAPL, MSFT, CASH", show_principal=True)
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 S = st.session_state
@@ -121,7 +121,7 @@ sb.number_input("Initial Capital ($)", 100, 10_000_000, step=1000, key="initial"
 sb.number_input("Annual DCA Contribution ($)", 0, 100_000, step=500, key="annual_contrib")
 
 sb.subheader("4. Chart Display Options")
-sb.checkbox("Show Individual Asset Curves", key="show_individual_assets")
+sb.checkbox("Show Total Invested Principal (No Interest)", key="show_principal")
 
 sb.subheader("5. Risk Controls")
 sb.slider("Stop-Loss (%)", 0, 50, key="stop_pct")
@@ -144,7 +144,7 @@ col_in.text_input(
     key="nl_text", 
     disabled=not has_key, 
     label_visibility="collapsed",
-    placeholder="e.g., Buy a custom basket of AAPL, MSFT, and 30% CASH"
+    placeholder="e.g., Buy momentum stocks with $10k initial and $5k annual DCA"
 )
 col_btn.button("Run Prompt", on_click=apply_nl, type="primary", disabled=not has_key)
 
@@ -206,7 +206,7 @@ try:
         st.error("Insufficient historical data for selected start year.")
         st.stop()
         
-    eq, be, yrs, asset_bd = res["equity"], res["bench"], res["years"], res["asset_breakdown"]
+    eq, be, yrs, asset_bd, principal = res["equity"], res["bench"], res["years"], res["asset_breakdown"], res["principal"]
     ms, mb = metrics(eq), metrics(be)
 
     # Top Executive Summary Metrics
@@ -220,26 +220,23 @@ try:
     strat_sharpe_val = ms.get('Sharpe (rf=0)', 0.0)
     m4.metric("Sharpe Ratio", f"{strat_sharpe_val:.2f}", bench_sharpe_text)
 
-    st.markdown("### Performance Trajectory & Asset Breakdown")
+    st.markdown("### Performance Trajectory & Principal Baseline")
     
-    # Professional Plotly Styling with Multi-Asset Traces
+    # Professional Plotly Styling with Principal Baseline
     fig = go.Figure()
     
     # Main Aggregate Strategy
-    fig.add_scatter(x=eq.index, y=eq, name="Total Portfolio", line=dict(width=3, color="#2ecc71"))
+    fig.add_scatter(x=eq.index, y=eq, name="Strategy Portfolio", line=dict(width=3, color="#2ecc71"))
     
-    # Individual Asset Traces if enabled
-    if S["show_individual_assets"] and not asset_bd.empty:
-        palette = ["#e67e22", "#9b59b6", "#1abc9c", "#e74c3c", "#f1c40f", "#3498db"]
-        for idx, col in enumerate(asset_bd.columns):
-            color = "#bdc3c7" if col.upper() == "CASH" else palette[idx % len(palette)]
-            fig.add_scatter(
-                x=asset_bd.index, 
-                y=asset_bd[col], 
-                name=f"Asset: {col}", 
-                line=dict(width=1.2, dash="dash", color=color),
-                opacity=0.85
-            )
+    # Total Invested Principal (No Interest) Trace
+    if S["show_principal"] and not principal.empty:
+        fig.add_scatter(
+            x=principal.index, 
+            y=principal, 
+            name="Total Cash Invested (No Interest)", 
+            line=dict(width=1.8, dash="dash", color="#e67e22"),
+            opacity=0.9
+        )
 
     # Benchmark Trace
     fig.add_scatter(x=be.index, y=be, name=f"Benchmark ({bench})", line=dict(width=1.5, color="#3498db", dash="dot"))
@@ -276,7 +273,7 @@ try:
 
     with tab3:
         st.markdown("""
-        * **Multi-Asset Allocation:** Supports custom asset baskets combined with cash reserves (`CASH`).
+        * **Principal Tracking:** Shows cumulative out-of-pocket cash contributed (Initial Capital + Annual DCA) without market returns.
         * **Rebalancing:** Executed annually on the first trading day of January.
         * **Frictions:** Modeled with basis point transaction fees and deferred capital gains tax drag.
         """)
