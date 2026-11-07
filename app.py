@@ -5,7 +5,6 @@ import streamlit as st
 
 import data
 import nlp
-import theme
 from catalog import BENCHMARKS, UNIVERSES
 from engine import RULES, drawdown, metrics, run_strategy, start_year_sensitivity
 
@@ -15,10 +14,26 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Professional Fintech CSS Injection (Ensuring sidebar controls stay visible)
+# Force Sidebar Visibility & High-Contrast Fintech Styling
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
+    
+    /* Force sidebar to be visible and properly styled */
+    section[data-testid="stSidebar"] {
+        display: block !important;
+        visibility: visible !important;
+        background-color: #11161d !important;
+        border-right: 1px solid #30363d !important;
+    }
+    
+    /* Ensure the sidebar collapse/expand toggle button is clearly visible */
+    button[kind="header"] {
+        background-color: #1f242c !important;
+        color: #ffffff !important;
+        border: 1px solid #30363d !important;
+    }
+
     .stMetric {
         background-color: #161b22;
         border: 1px solid #30363d;
@@ -34,11 +49,6 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
-
-try:
-    theme.inject()
-except Exception:
-    pass
 
 MIN_START = 2005
 PICK_RULES = [k for k in RULES if k != "random"]
@@ -80,7 +90,7 @@ def apply_nl():
         S["nl_msg"] = ("error", f"Couldn't read that prompt: {e}", "")
 
 
-# ---------------- Sidebar Controls ----------------
+# ---------------- Sidebar Controls (Explicitly Rendered) ----------------
 sb = st.sidebar
 sb.title("⚙️ Terminal Config")
 sb.markdown("---")
