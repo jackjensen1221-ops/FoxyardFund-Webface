@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Professional Fintech CSS Injection
+# Professional Fintech CSS Injection (Ensuring sidebar controls stay visible)
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
@@ -24,10 +24,6 @@ st.markdown("""
         border: 1px solid #30363d;
         padding: 15px;
         border-radius: 8px;
-    }
-    div[data-testid="stSidebar"] {
-        background-color: #0d1117;
-        border-right: 1px solid #30363d;
     }
     .card {
         background-color: #161b22;
@@ -66,7 +62,25 @@ def get_api_key():
         return os.environ.get("ANTHROPIC_API_KEY")
 
 
-# ---------------- Professional Sidebar ----------------
+def apply_nl():
+    """Parses plain-English prompts using the Anthropic API via nlp.py"""
+    text = S.get("nl_text", "").strip()
+    if not text:
+        return
+    if S.get("nl_calls", 0) >= 10:
+        S["nl_msg"] = ("error", "Scenario limit reached for this session.", "")
+        return
+    S["nl_calls"] = S.get("nl_calls", 0) + 1
+    try:
+        out = nlp.parse_question(text, get_api_key())
+        for k, v in out["widgets"].items():
+            S[k] = v
+        S["nl_msg"] = ("ok", out["explanation"], out["unsupported"])
+    except Exception as e:
+        S["nl_msg"] = ("error", f"Couldn't read that prompt: {e}", "")
+
+
+# ---------------- Sidebar Controls ----------------
 sb = st.sidebar
 sb.title("⚙️ Terminal Config")
 sb.markdown("---")
@@ -115,6 +129,32 @@ sb.slider("Capital Gains Tax Rate (%)", 0, 50, key="tax_pct")
 # ---------------- Main Dashboard Layout ----------------
 st.title("📊 Quantitative Portfolio Backtest Terminal")
 st.markdown("Institutional-grade multi-factor strategy simulation and benchmark comparison engine.")
+
+# Natural Language Prompt Bar (Powered by Anthropic API)
+has_key = bool(get_api_key())
+col_in, col_btn = st.columns([6, 1], vertical_alignment="bottom")
+col_in.text_input(
+    "AI Strategy Prompt", 
+    key="nl_text", 
+    disabled=not has_key, 
+    label_visibility="collapsed",
+    placeholder="e.g., Buy the 3 best NYSE stocks of last year, sell if down 15%"
+)
+col_btn.button("Run Prompt", on_click=apply_nl, type="primary", disabled=not has_key)
+
+if not has_key:
+    st.caption("💡 *To enable AI prompts, add your `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml`.*")
+
+msg = S.get("nl_msg")
+if msg:
+    kind, text, extra = msg
+    if kind == "ok":
+        st.success(f"🤖 **AI Scenario Applied:** {text}")
+    else:
+        st.error(text)
+    if extra:
+        st.caption(f"Note: {extra}")
+
 st.markdown("---")
 
 try:
@@ -161,7 +201,7 @@ try:
     eq, be, yrs = res["equity"], res["bench"], res["years"]
     ms, mb = metrics(eq), metrics(be)
 
-    # Top Executive Summary Metrics (Safe parsing)
+    # Top Executive Summary Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Final Portfolio Value", f"${ms['Final value']:,.2f}", f"{ms['CAGR']*100:+.2f}% CAGR")
     m2.metric("Benchmark Value", f"${mb['Final value']:,.2f}", f"{mb['CAGR']*100:+.2f}% CAGR")
