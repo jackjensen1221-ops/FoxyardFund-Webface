@@ -106,4 +106,138 @@ def run_custom_fund(prices, weights_dict, start_year, initial=10000.0, annual_co
 
 def run_strategy(prices, bench_ticker, start_year, rule="prior_year_winner", top_n=1,
                  stop_pct=15, trailing=False, after_stop="cash", cost_bps=5, tax_rate=0.0,
-                 initial=10000.0, annual_contribution=10000.0, custom
+                 initial=10000.0, annual_contribution=10000.0, custom_weights=None, reinvest_dividends=True):
+    if prices.empty:
+        return None
+    df = prices.loc[prices.index.year >= start_year].copy()
+    if df.empty:
+        return None
+    if bench_ticker in df.columns:
+        bench_series = df[bench_ticker]
+        stock_df = df.drop(columns=[bench_ticker], errors="ignore")
+    else:
+        bench_series = df.iloc[:, 0]
+        stock_df = df.copy()
+
+    dates = df.index
+    n_days = len(dates)
+    if n_days < 5:
+        return None
+
+    total_invested = float(initial)
+    strat_val = float(initial)
+    bench_val = float(initial)
+    cum_cash_dividends = 0.0
+    
+    eq_vals = [strat_val]
+    bench_vals = [bench_val]
+    prin_vals = [total_invested]
+    div_cash_vals = [0.0]
+    annual_div_payouts = []
+    
+    last_year = dates[0].year
+    curr_yr_divs = 0.0
+    
+    active_tickers = list(stock_df.columns[:top_n]) if not stock_df.empty else []
+    if rule == "custom_basket" and custom_weights:
+        active_tickers = [t for t in custom_weights.keys() if t.upper() != "CASH" and t in stock_df.columns]
+
+    stock_rets = stock_df.pct_change().fillna(0.0)
+    bench_rets = bench_series.pct_change().fillna(0.0)
+    daily_div_rate = 0.000075
+
+    for i in range(1, n_days):
+        dt = dates[i]
+        curr_year = dt.year
+        
+        b_ret = bench_rets.loc[dt] if dt in bench_rets.index else 0.0
+        if np.isnan(b_ret):
+            b_ret = 0.0
+
+        if curr_year != last_year:
+            total_invested += annual_contribution
+            strat_val += annual_contribution
+            bench_val += annual_contribution
+            annual_div_payouts.append({"Year": last_year, "Annual Dividend Income ($)": curr_yr_divs})
+            curr_yr_divs = 0.0
+            last_year = curr_year
+            
+            if not stock_df.empty and len(stock_df.columns) > 0:
+                if rule == "prior_year_winner":
+                    past_slice = stock_df.loc[stock_df.index.year < curr_year]
+                    if not past_slice.empty:
+                        yr_ret = (past_slice.iloc[-1] / past_slice.iloc[0]) - 1
+                        active_tickers = yr_ret.nlargest(top_n).index.tolist()
+                elif rule == "prior_year_loser":
+                    past_slice = stock_df.loc[stock_df.index.year < curr_year]
+                    if not past_slice.empty:
+                        yr_ret = (past_slice.iloc[-1] / past_slice.iloc[0]) - 1
+                        active_tickers = yr_ret.nsmallest(top_n).index.tolist()
+                else:
+                    active_tickers = stock_df.columns[:top_n].tolist()
+
+        if active_tickers and all(t in stock_rets.columns for t in active_tickers):
+            s_ret = stock_rets.loc[dt, active_tickers].mean()
+        else:
+            s_ret = b_ret
+            
+        if np.isnan(s_ret):
+            s_ret = 0.0
+            
+        day_div_amount = strat_val * daily_div_rate
+        if not reinvest_dividends:
+            cum_cash_dividends += day_div_amount
+            curr_yr_divs += day_div_amount
+            s_ret -= daily_div_rate
+
+        if curr_year != last_year:
+            s_ret -= (cost_bps / 10000.0)
+
+        strat_val = strat_val * (1.0 + s_ret)
+        bench_val = bench_val * (1.0 + b_ret)
+
+        eq_vals.append(strat_val)
+        bench_vals.append(bench_val)
+        prin_vals.append(total_invested)
+        div_cash_vals.append(cum_cash_dividends)
+
+    annual_div_payouts.append({"Year": last_year, "Annual Dividend Income ($)": curr_yr_divs})
+
+    equity_curve = pd.Series(eq_vals, index=dates)
+    bench_scaled = pd.Series(bench_vals, index=dates)
+    principal_curve = pd.Series(prin_vals, index=dates)
+    dividend_curve = pd.Series(div_cash_vals, index=dates)
+
+    years = sorted(list(set(dates.year)))
+    yrs_data = []
+    for yr in years:
+        yr_slice = equity_curve[equity_curve.index.year == yr]
+        if len(yr_slice) > 1:
+            ret = (yr_slice.iloc[-1] / yr_slice.iloc[0]) - 1
+            bench_yr = bench_scaled[bench_scaled.index.year == yr]
+            b_ret = (bench_yr.iloc[-1] / bench_yr.iloc[0]) - 1 if len(bench_yr) > 1 else 0.0
+            yrs_data.append({"Year": yr, "Strategy": ret, "Benchmark": b_ret, "Tax paid": 0.0})
+            
+    yrs_df = pd.DataFrame(yrs_data)
+    
+    asset_metrics_list = []
+    for t in stock_df.columns[:10]:
+        t_series = stock_df[t].dropna()
+        if not t_series.empty:
+            t_fin = initial * (t_series.iloc[-1] / t_series.iloc[0])
+            t_cagr = (t_series.iloc[-1] / t_series.iloc[0]) ** (1 / max((t_series.index[-1] - t_series.index[0]).days / 365.25, 0.01)) - 1
+            asset_metrics_list.append({"Asset": t, "Final Value ($)": t_fin, "Annualized CAGR": t_cagr})
+            
+    asset_metrics = pd.DataFrame(asset_metrics_list) if asset_metrics_list else pd.DataFrame(columns=["Asset", "Final Value ($)", "Annualized CAGR"])
+
+    return {
+        "equity": equity_curve,
+        "bench": bench_scaled,
+        "years": yrs_df,
+        "asset_breakdown": stock_df,
+        "principal": principal_curve,
+        "asset_metrics": asset_metrics,
+        "dividend_curve": dividend_curve,
+        "annual_dividends": pd.DataFrame(annual_div_payouts),
+        "total_cash_dividends": cum_cash_dividends
+    }
